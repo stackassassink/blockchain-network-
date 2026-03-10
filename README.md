@@ -26,19 +26,24 @@ rotates round-robin across all healthy nodes.
 ```
 blockchain-network/
 ├── backend/
-│   ├── app.py                # Flask entry point, REST API & WebSocket server
-│   └── network_manager.py    # Core simulation: nodes, edges, PBFT, attacks,
-│                             # EdgeMetrics (latency/bandwidth/jitter/RTT)
-├── frontend/
-│   └── src/
-│       ├── App.jsx           # Main dashboard, Socket.IO client
-│       └── components/
-│           ├── NetworkGraph.jsx   # D3.js live topology with fixed layout
-│           ├── LogFeed.jsx        # Real-time event log (newest on top)
-│           ├── ConsensusBar.jsx   # PBFT voting progress visualiser
-│           ├── MetricsPanel.jsx   # Per-edge metrics table (live values)
-│           └── MetricsGraphs.jsx  # Canvas sparkline graphs for all metrics
-└── README.md
+│   ├── app.py                 # Flask + SocketIO API
+│   ├── network_manager.py     # Core orchestration
+│   ├── network.py             # Topology simulation
+│   ├── node.py                # Node model
+│   ├── chain.py               # Blockchain layer
+│   ├── consensus.py           # BFT consensus logic
+│   ├── attacks.py             # Attack simulation engine
+│   └── requirements.txt
+├── contracts/                 # Smart contracts (Ganache)
+└── frontend/src/
+    ├── App.jsx                # Main app + SocketIO
+    └── components/
+        ├── NetworkGraph.jsx   # D3 topology visualizer
+        ├── AttackPanel.jsx    # Attack controls
+        ├── MetricsGraphs.jsx  # Live charts
+        ├── ConsensusBar.jsx   # Consensus visualizer
+        ├── LogFeed.jsx        # Event log
+        └── StatsBar.jsx       # Stats header
 ```
 
 ---
