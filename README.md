@@ -27,12 +27,7 @@ rotates round-robin across all healthy nodes.
 blockchain-network/
 ├── backend/
 │   ├── app.py                 # Flask + SocketIO API
-│   ├── network_manager.py     # Core orchestration
-│   ├── network.py             # Topology simulation
-│   ├── node.py                # Node model
-│   ├── chain.py               # Blockchain layer
-│   ├── consensus.py           # BFT consensus logic
-│   ├── attacks.py             # Attack simulation engine
+│   ├── network_manager.py     # Core orchestration 
 │   └── requirements.txt
 ├── contracts/                 # Smart contracts (Ganache)
 └── frontend/src/
