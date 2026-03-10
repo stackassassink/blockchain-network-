@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background: #040d18;
+  color: #c8e6ff;
+  font-family: "Exo 2", sans-serif;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+* { box-sizing: border-box; }
+
+/* Glowing ring on compromised nodes */
+@keyframes glow-pulse {
+  0%, 100% { filter: drop-shadow(0 0 4px #ff3e3e) drop-shadow(0 0 10px #ff0000); }
+  50%       { filter: drop-shadow(0 0 10px #ff3e3e) drop-shadow(0 0 24px #ff0000); }
+}
+
+@keyframes heal-pulse {
+  0%, 100% { filter: drop-shadow(0 0 4px #00ff88); }
+  50%       { filter: drop-shadow(0 0 12px #00ff88) drop-shadow(0 0 24px #00ff88); }
+}
+
+.node-compromised { animation: glow-pulse 1.2s ease-in-out infinite; }
+.node-healing     { animation: heal-pulse 0.8s ease-in-out infinite; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: #040d18; }
+::-webkit-scrollbar-thumb { background: #1a3a5c; border-radius: 2px; }
+
+/* Mono font utility */
+.font-mono-tech { font-family: "Share Tech Mono", monospace; }
