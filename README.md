@@ -41,10 +41,6 @@ blockchain-network/
 └── README.md
 ```
 
-> **Note:** The project uses a single `network_manager.py` file for all
-> backend logic. There are no separate `node.py`, `chain.py`,
-> `consensus.py`, `attacks.py`, or `contracts/` directories.
-
 ---
 
 ## ⚙️ Tech Stack
