@@ -236,6 +236,7 @@ class NetworkManager:
         self._round             = 0
         self._primary_idx       = 0
         self._attack_active     = False
+        self._paused            = False
         self._compromised_nodes = set()
         self._phase             = "idle"
 
@@ -288,6 +289,8 @@ class NetworkManager:
         self._schedule_mine()
 
     def _schedule_mine(self):
+        if self._paused:        
+            return
         t = threading.Timer(BLOCK_INTERVAL, self._mine_block)
         t.daemon = True
         self._block_timer = t
@@ -342,6 +345,8 @@ class NetworkManager:
         self._schedule_comms()
 
     def _schedule_comms(self):
+        if self._paused:        
+            return
         if self._phase == "attack":
             delay = COMMS_TICK_ATTACK
         elif self._phase == "consensus":
@@ -509,6 +514,37 @@ class NetworkManager:
         self._start_miner()
         self._start_comms()
         return {"status": "reset_complete"}
+    
+    def pause_network(self):
+        with self._lock:
+            if self._paused:
+                return {"status": "already_paused"}
+            self._paused = True
+            self._phase  = "paused"
+
+        if self._block_timer:
+            self._block_timer.cancel()
+        if self._comms_timer:
+            self._comms_timer.cancel()
+
+        self._emit("phase_change", {"phase": "paused"})
+        self._emit_log("⏸  NETWORK PAUSED — all simulation timers halted", "warning")
+        self._push_update()
+        return {"status": "paused"}
+
+    def resume_network(self):
+        with self._lock:
+            if not self._paused:
+                return {"status": "not_paused"}
+            self._paused = False
+            self._phase  = "idle"
+
+        self._emit("phase_change", {"phase": "idle"})
+        self._emit_log("▶  NETWORK RESUMED — simulation restarted", "success")
+        self._push_update()
+        self._start_miner()
+        self._start_comms()
+        return {"status": "resumed"}
 
     # ── Attack sequence ───────────────────────────────────────────────────
 

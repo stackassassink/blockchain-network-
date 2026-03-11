@@ -81,6 +81,14 @@ def api_heal():
 def api_reset():
     return jsonify(manager.reset_network())
 
+@app.route("/api/pause", methods=["POST"])
+def pause_network():
+    return jsonify(manager.pause_network())
+
+@app.route("/api/resume", methods=["POST"])
+def resume_network():
+    return jsonify(manager.resume_network())
+
 @app.route("/api/state",  methods=["GET"])
 def api_state():
     return jsonify(manager.get_network_state())

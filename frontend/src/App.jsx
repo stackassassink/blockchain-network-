@@ -18,12 +18,13 @@ const STATUS_COLOR = {
   quarantined:"#ffaa00", healing:"#00ddff", suspect:"#ffee00",
 };
 const PHASE_COLOR = {
-  idle:"#00ff88", attack:"#ff4444", consensus:"#cc88ff", healing:"#00ddff",
+  idle:"#00ff88", attack:"#ff4444", consensus:"#cc88ff", healing:"#00ddff",paused:"#ffaa00",
 };
 const PHASE_LABEL = {
   idle:"NETWORK STABLE", attack:"UNDER ATTACK",
-  consensus:"PBFT CONSENSUS", healing:"HEALING",
+  consensus:"PBFT CONSENSUS", healing:"HEALING", paused:"⏸ NETWORK PAUSED",
 };
+
 
 function SLabel({ children }) {
   return (
@@ -121,11 +122,21 @@ export default function App() {
   }, [nodes]);
 
   const doReset = useCallback(() => {
+    setIsPaused(false);
     setConsensusVotes({});
     accumulatedMetrics.current = {};
     setEdgeMetrics({});
     fetch("http://localhost:5000/api/reset", { method:"POST" }).catch(console.error);
   }, []);
+  
+  const [isPaused, setIsPaused] = useState(false);
+
+  const doPause = useCallback(() => {
+    const endpoint = isPaused ? "/api/resume" : "/api/pause";
+    fetch(`http://localhost:5000${endpoint}`, { method: "POST" })
+      .catch(console.error);
+    setIsPaused(v => !v);
+  }, [isPaused]);
 
   // Seed initial metrics via REST on connect so panel isn't blank at startup
   useEffect(() => {
@@ -289,6 +300,56 @@ export default function App() {
           ))}
 
           <SLabel>RECOVERY</SLabel>
+
+          {/* ── PAUSE / RESUME BUTTON ── */}
+          <button
+            onClick={doPause}
+            style={{
+              background: isPaused ? "#2a1a00" : "#071624",
+              border: `2px solid ${isPaused ? "#ffaa00" : "#ffaa0055"}`,
+              borderRadius: "8px",
+              padding: "11px",
+              color: isPaused ? "#ffaa00" : "#ffaa0099",
+              fontSize: "12px",
+              fontWeight: 800,
+              cursor: "pointer",
+              letterSpacing: "2px",
+              marginBottom: 8,
+              width: "100%",
+              transition: "all 0.2s",
+              fontFamily: "'Courier New',monospace",
+              boxShadow: isPaused ? "0 0 18px #ffaa0033" : "none",
+            }}
+            onMouseEnter={e => {
+              e.currentTarget.style.borderColor = "#ffaa00";
+              e.currentTarget.style.boxShadow   = "0 0 20px #ffaa0044";
+            }}
+            onMouseLeave={e => {
+              e.currentTarget.style.borderColor = isPaused ? "#ffaa00" : "#ffaa0055";
+              e.currentTarget.style.boxShadow   = isPaused ? "0 0 18px #ffaa0033" : "none";
+            }}
+          >
+            {isPaused ? "▶  RESUME NETWORK" : "⏸  PAUSE NETWORK"}
+          </button>
+
+          {/* Status badge shown only when paused */}
+          {isPaused && (
+            <div style={{
+              fontSize: "10px",
+              color: "#ffaa00",
+              background: "#ffaa0011",
+              border: "1px solid #ffaa0033",
+              borderRadius: "6px",
+              padding: "6px 10px",
+              marginBottom: 8,
+              textAlign: "center",
+              letterSpacing: "1px",
+              fontWeight: 700,
+            }}>
+              ⚠ ALL COMMS SUSPENDED
+            </div>
+          )}
+
           <button onClick={doReset} style={{
             background:"#071624", border:"2px solid #44ccff55",
             borderRadius:"8px", padding:"11px", color:"#44ccff",
