@@ -603,7 +603,7 @@ export default function MetricsGraphs({ edgeMetrics, phase }) {
 
       <style>{`
         @keyframes blink {
-          0%,100% { opacity: 1; }
+          0%,100% { opacity: 1; }q
           50%      { opacity: 0.3; }
         }
       `}</style>
