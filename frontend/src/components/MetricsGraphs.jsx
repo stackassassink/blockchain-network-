@@ -1,335 +1,423 @@
+/**
+ * MetricsGraphs.jsx — Fixed v3
+ *
+ * ROOT CAUSE FIXES:
+ *  1. avg() now computes a WEIGHTED average — near-attack edges contribute
+ *     more weight so spikes aren't diluted by 7 idle edges.
+ *  2. Bandwidth graph Y-axis INVERTED: low BW draws HIGH on canvas so a
+ *     DoS attack is visually a spike upward (not a drop nobody notices).
+ *  3. Dynamic Y-axis: each graph auto-scales to [min(history), max(history)]
+ *     with a padding factor — attack spikes fill the graph, not just 5%.
+ *  4. Phase overlay: red/purple shading on graph background during attack/consensus.
+ *  5. "SPIKE DETECTED" badge when current value crosses warn/crit threshold.
+ */
+
 import { useState, useEffect, useRef } from "react";
 
-const MAX_POINTS = 100;
+const MAX_POINTS = 80;
 
-// ── Metric configs ─────────────────────────────────────────────────────────────
-// BANDWIDTH: higherBad:false → low BW = red (attack drops BW to 2-15 Mb/s)
-// All others: higherBad:true → high value = red
+// ── Metric config ─────────────────────────────────────────────────────────────
 const METRICS_CONFIG = [
   {
     key: "bandwidth",
     label: "NETWORK BANDWIDTH",
     unit: "Mb/s",
-    max: 150,
-    // Thresholds for LOW-is-bad:
-    // critAt = below this → CRITICAL (attack: 2–15 Mb/s)
-    // warnAt = below this → WARNING  (congestion: ~45 Mb/s)
-    // above warnAt        → NOMINAL  (healthy: 80–120 Mb/s)
-    warnAt: 45,
-    critAt: 15,
-    higherBad: false,
+    baselineMin: 60,
+    baselineMax: 140,
+    higherBad: false,      // LOW bandwidth = bad
+    warnAt: 45,            // warn if drops below this
+    critAt: 15,            // crit if drops below this
     goodColor: "#00ff88",
     warnColor: "#ffcc00",
     critColor: "#ff3333",
     bgColor:   "#061410",
     gridColor: "#0d2820",
-    description: "Avg bandwidth — drops sharply during attack",
+    description: "Drops during DoS (queue saturation), spikes briefly at flood start",
+    invertY: true,         // draw low-BW as HIGH on graph so attack = visible spike
   },
   {
     key: "latency",
     label: "AVG LATENCY",
     unit: "ms",
-    max: 500,
-    warnAt: 60,
-    critAt: 150,
+    baselineMin: 8,
+    baselineMax: 60,
     higherBad: true,
+    warnAt: 80,
+    critAt: 200,
     goodColor: "#44ddff",
     warnColor: "#ffcc00",
     critColor: "#ff3333",
     bgColor:   "#061218",
     gridColor: "#0d2030",
-    description: "Mean latency — spikes during attack/consensus",
+    description: "Spikes sharply during attack — queue saturation",
+    invertY: false,
   },
   {
     key: "packet_loss",
     label: "PACKET LOSS",
     unit: "%",
-    max: 80,
-    warnAt: 5,
-    critAt: 20,
+    baselineMin: 0,
+    baselineMax: 5,
     higherBad: true,
+    warnAt: 8,
+    critAt: 25,
     goodColor: "#ff8844",
     warnColor: "#ff5500",
     critColor: "#ff1111",
     bgColor:   "#180a06",
     gridColor: "#2a1408",
-    description: "Dropped packet ratio — soars during DoS attack",
+    description: "Soars during DoS (buffer overflow)",
+    invertY: false,
   },
   {
     key: "jitter",
     label: "JITTER",
     unit: "ms",
-    max: 100,
-    warnAt: 15,
-    critAt: 45,
+    baselineMin: 1,
+    baselineMax: 10,
     higherBad: true,
+    warnAt: 20,
+    critAt: 60,
     goodColor: "#ffee44",
     warnColor: "#ff9900",
     critColor: "#ff3333",
     bgColor:   "#161400",
     gridColor: "#262200",
-    description: "Packet delivery variation — rises under load",
+    description: "Packet timing variance — rises under attack load",
+    invertY: false,
   },
   {
     key: "rtt",
     label: "ROUND-TRIP TIME",
     unit: "ms",
-    max: 1000,
-    warnAt: 120,
-    critAt: 350,
+    baselineMin: 16,
+    baselineMax: 100,
     higherBad: true,
+    warnAt: 150,
+    critAt: 400,
     goodColor: "#bb88ff",
     warnColor: "#ffcc00",
     critColor: "#ff3333",
     bgColor:   "#0e0816",
     gridColor: "#1a1028",
-    description: "Average RTT — rises with latency during attack",
+    description: "Doubles with latency — rises sharply during attack",
+    invertY: false,
   },
 ];
 
-function avg(edgeMetrics, key) {
+// ── Weighted average ──────────────────────────────────────────────────────────
+// Edges near the attack get 4× weight so the spike shows in averages.
+// We detect "attack edges" as those with extremely degraded metrics.
+function weightedAvg(edgeMetrics, key, isHigherBad) {
   const vals = Object.values(edgeMetrics);
   if (!vals.length) return 0;
-  return vals.reduce((s, e) => s + (e[key] ?? 0), 0) / vals.length;
+
+  const allVals = vals.map(e => e[key] ?? 0);
+  const globalMedian = [...allVals].sort((a, b) => a - b)[Math.floor(allVals.length / 2)];
+
+  let sumW = 0, sumV = 0;
+  for (const v of allVals) {
+    // Weight = 4 if this is clearly an outlier (attack edge), else 1
+    const isOutlier = isHigherBad
+      ? v > globalMedian * 2.5
+      : v < globalMedian * 0.4;
+    const w = isOutlier ? 4 : 1;
+    sumW += w;
+    sumV += w * v;
+  }
+  return sumV / sumW;
 }
 
-// ── Color: respects higherBad direction ───────────────────────────────────────
-function getLineColor(val, cfg) {
-  if (cfg.higherBad) {
-    // High value = bad
-    if (val >= cfg.critAt) return cfg.critColor;
-    if (val >= cfg.warnAt) return cfg.warnColor;
-    return cfg.goodColor;
-  } else {
-    // Low value = bad (bandwidth)
-    if (val <= cfg.critAt) return cfg.critColor;
-    if (val <= cfg.warnAt) return cfg.warnColor;
-    return cfg.goodColor;
-  }
-}
-
-function getStatusLabel(val, cfg) {
-  if (cfg.higherBad) {
-    if (val >= cfg.critAt) return "CRITICAL";
-    if (val >= cfg.warnAt) return "WARNING";
-    return "NOMINAL";
-  } else {
-    if (val <= cfg.critAt) return "CRITICAL";
-    if (val <= cfg.warnAt) return "WARNING";
-    return "NOMINAL";
-  }
-}
-
-// ── Canvas — zoomed dynamic Y so every fluctuation is visible ─────────────────
-function drawCanvas(canvas, points, cfg) {
-  if (!canvas || points.length < 2) return;
-
-  const rect = canvas.getBoundingClientRect();
-  const W = Math.floor(rect.width  || 400);
-  const H = Math.floor(rect.height || 90);
-  if (canvas.width !== W || canvas.height !== H) {
-    canvas.width  = W;
-    canvas.height = H;
-  }
-  const ctx = canvas.getContext("2d");
-
-  // Dynamic Y: zoom into actual data range for visibility
-  const rawMin = Math.min(...points);
-  const rawMax = Math.max(...points);
-  const spread = rawMax - rawMin;
-  const pad    = Math.max(spread * 0.4, cfg.max * 0.04);
-  const yMin   = Math.max(0,       rawMin - pad);
-  const yMax   = Math.min(cfg.max, rawMax + pad);
-  const yRange = yMax - yMin || 1;
-  const toY    = v => H - 5 - ((Math.min(Math.max(v, yMin), yMax) - yMin) / yRange) * (H - 10);
-
-  ctx.fillStyle = cfg.bgColor;
-  ctx.fillRect(0, 0, W, H);
-
-  // Grid lines
-  ctx.strokeStyle = cfg.gridColor; ctx.lineWidth = 1;
-  [0.25, 0.5, 0.75].forEach(p => {
-    const y = Math.floor(H * p) + 0.5;
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-  });
-
-  // Threshold lines — only render if inside visible range
-  const drawT = (val, color) => {
-    if (val < yMin || val > yMax) return;
-    const y = Math.floor(toY(val)) + 0.5;
-    ctx.save();
-    ctx.strokeStyle = color; ctx.globalAlpha = 0.75;
-    ctx.setLineDash([5, 4]); ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
-    ctx.restore();
-  };
-  drawT(cfg.warnAt, cfg.warnColor);
-  drawT(cfg.critAt, cfg.critColor);
-
-  const latest    = points[points.length - 1];
-  const lineColor = getLineColor(latest, cfg);
-  const coords    = points.map((v, i) => ({
-    x: (i / (points.length - 1)) * (W - 8) + 4,
-    y: toY(v),
-  }));
-
-  // Area fill
-  const grad = ctx.createLinearGradient(0, 0, 0, H);
-  grad.addColorStop(0, lineColor + "55");
-  grad.addColorStop(1, lineColor + "00");
-  ctx.beginPath();
-  coords.forEach((c, i) => i === 0 ? ctx.moveTo(c.x, c.y) : ctx.lineTo(c.x, c.y));
-  ctx.lineTo(coords[coords.length - 1].x, H);
-  ctx.lineTo(coords[0].x, H);
-  ctx.closePath();
-  ctx.fillStyle = grad; ctx.fill();
-
-  // Glow stroke
-  ctx.beginPath(); ctx.strokeStyle = lineColor; ctx.lineWidth = 3;
-  ctx.lineJoin = "round"; ctx.shadowColor = lineColor; ctx.shadowBlur = 10;
-  coords.forEach((c, i) => i === 0 ? ctx.moveTo(c.x, c.y) : ctx.lineTo(c.x, c.y));
-  ctx.stroke(); ctx.shadowBlur = 0;
-
-  // Crisp stroke
-  ctx.beginPath(); ctx.lineWidth = 1.8;
-  coords.forEach((c, i) => i === 0 ? ctx.moveTo(c.x, c.y) : ctx.lineTo(c.x, c.y));
-  ctx.stroke();
-
-  // Y-axis scale labels
-  ctx.fillStyle = "#33445599"; ctx.font = "9px 'Courier New'";
-  ctx.fillText(yMax.toFixed(0), 4, 12);
-  ctx.fillText(yMin.toFixed(0), 4, H - 4);
-
-  // Live dot
-  const last = coords[coords.length - 1];
-  ctx.beginPath(); ctx.arc(last.x, last.y, 5, 0, Math.PI * 2);
-  ctx.fillStyle = "#fff"; ctx.shadowColor = lineColor; ctx.shadowBlur = 14;
-  ctx.fill(); ctx.shadowBlur = 0;
-  ctx.beginPath(); ctx.arc(last.x, last.y, 3, 0, Math.PI * 2);
-  ctx.fillStyle = lineColor; ctx.fill();
-
-  // Attack region highlight on right quarter when recently critical
-  const recent    = points.slice(-Math.ceil(points.length * 0.25));
-  const isCritical = cfg.higherBad
-    ? Math.max(...recent) >= cfg.critAt
-    : Math.min(...recent) <= cfg.critAt;
-
-  if (isCritical) {
-    const sx = coords[Math.floor(coords.length * 0.75)]?.x ?? W * 0.75;
-    const hl = ctx.createLinearGradient(sx, 0, W, 0);
-    hl.addColorStop(0, cfg.critColor + "00");
-    hl.addColorStop(1, cfg.critColor + "28");
-    ctx.fillStyle = hl;
-    ctx.fillRect(sx, 0, W - sx, H);
-  }
-}
-
-// ── Metric card ───────────────────────────────────────────────────────────────
-function MetricCard({ cfg, points }) {
+// ── Canvas sparkline ──────────────────────────────────────────────────────────
+function Sparkline({ history, cfg, phase }) {
   const canvasRef = useRef(null);
-  const latest    = points.length > 0 ? points[points.length - 1] : null;
-  const valColor  = latest !== null ? getLineColor(latest, cfg) : "#2a5a7a";
-
-  const minVal = points.length ? Math.min(...points) : 0;
-  const maxVal = points.length ? Math.max(...points) : 0;
-  const avgVal = points.length ? points.reduce((a, b) => a + b, 0) / points.length : 0;
-
-  const statusLabel = latest !== null ? getStatusLabel(latest, cfg) : "NO DATA";
-  const statusColor =
-    statusLabel === "CRITICAL" ? cfg.critColor :
-    statusLabel === "WARNING"  ? cfg.warnColor : cfg.goodColor;
 
   useEffect(() => {
-    const id = requestAnimationFrame(() => drawCanvas(canvasRef.current, points, cfg));
-    return () => cancelAnimationFrame(id);
-  }, [points, cfg]);
+    const canvas = canvasRef.current;
+    if (!canvas || history.length < 2) return;
+    const ctx    = canvas.getContext("2d");
+    const W      = canvas.width;
+    const H      = canvas.height;
 
-  useEffect(() => {
-    const ro = new ResizeObserver(() =>
-      requestAnimationFrame(() => drawCanvas(canvasRef.current, points, cfg))
-    );
-    if (canvasRef.current) ro.observe(canvasRef.current);
-    return () => ro.disconnect();
-  }, [points, cfg]);
+    // Dynamic Y range: auto-scale to data with 15% padding
+    const rawVals = history.map(h => h[cfg.key] ?? 0);
+    let dataMin = Math.min(...rawVals);
+    let dataMax = Math.max(...rawVals);
 
-  // Direction hint shown in header
-  const directionHint = cfg.higherBad ? "↓ lower = better" : "↑ higher = better";
+    // Always show at least the baseline range so idle graphs aren't flat lines
+    dataMin = Math.min(dataMin, cfg.baselineMin);
+    dataMax = Math.max(dataMax, cfg.baselineMax);
+
+    const pad   = (dataMax - dataMin) * 0.15;
+    const yMin  = Math.max(0, dataMin - pad);
+    const yMax  = dataMax + pad;
+    const yRange = yMax - yMin || 1;
+
+    const toY = (v) => {
+      const norm = (v - yMin) / yRange;
+      // invertY: low value → high on canvas (visually = spike for bandwidth drop)
+      return cfg.invertY ? H * norm : H * (1 - norm);
+    };
+
+    // ── Background ────────────────────────────────────────────────────────
+    ctx.fillStyle = cfg.bgColor;
+    ctx.fillRect(0, 0, W, H);
+
+    // Phase background tint
+    if (phase === "attack") {
+      ctx.fillStyle = "rgba(255,50,50,0.07)";
+      ctx.fillRect(0, 0, W, H);
+    } else if (phase === "consensus") {
+      ctx.fillStyle = "rgba(180,100,255,0.07)";
+      ctx.fillRect(0, 0, W, H);
+    }
+
+    // ── Grid lines ─────────────────────────────────────────────────────────
+    ctx.strokeStyle = cfg.gridColor;
+    ctx.lineWidth   = 0.5;
+    for (let i = 1; i < 4; i++) {
+      const y = (H / 4) * i;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(W, y);
+      ctx.stroke();
+    }
+
+    // ── Threshold line ─────────────────────────────────────────────────────
+    if (cfg.higherBad && cfg.critAt <= yMax) {
+      const ty = toY(cfg.critAt);
+      ctx.strokeStyle = cfg.critColor + "55";
+      ctx.lineWidth   = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, ty);
+      ctx.lineTo(W, ty);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    } else if (!cfg.higherBad && cfg.warnAt >= yMin) {
+      const ty = toY(cfg.warnAt);
+      ctx.strokeStyle = cfg.warnColor + "55";
+      ctx.lineWidth   = 1;
+      ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      ctx.moveTo(0, ty);
+      ctx.lineTo(W, ty);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }
+
+    // ── Area fill ──────────────────────────────────────────────────────────
+    const pts = history.map((h, i) => ({
+      x: (i / (history.length - 1)) * W,
+      y: toY(h[cfg.key] ?? 0),
+    }));
+
+    const currentVal = rawVals[rawVals.length - 1];
+    const lineColor  = getColor(cfg, currentVal);
+
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, H);
+    ctx.lineTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+      const cp = {
+        x: (pts[i - 1].x + pts[i].x) / 2,
+        y: (pts[i - 1].y + pts[i].y) / 2,
+      };
+      ctx.quadraticCurveTo(pts[i - 1].x, pts[i - 1].y, cp.x, cp.y);
+    }
+    ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+    ctx.lineTo(pts[pts.length - 1].x, H);
+    ctx.closePath();
+    const grad = ctx.createLinearGradient(0, 0, 0, H);
+    grad.addColorStop(0, lineColor + "55");
+    grad.addColorStop(1, lineColor + "08");
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // ── Line ──────────────────────────────────────────────────────────────
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) {
+      const cp = {
+        x: (pts[i - 1].x + pts[i].x) / 2,
+        y: (pts[i - 1].y + pts[i].y) / 2,
+      };
+      ctx.quadraticCurveTo(pts[i - 1].x, pts[i - 1].y, cp.x, cp.y);
+    }
+    ctx.lineTo(pts[pts.length - 1].x, pts[pts.length - 1].y);
+    ctx.strokeStyle = lineColor;
+    ctx.lineWidth   = 2;
+    ctx.stroke();
+
+    // ── Latest dot ────────────────────────────────────────────────────────
+    const last = pts[pts.length - 1];
+    ctx.beginPath();
+    ctx.arc(last.x, last.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = lineColor;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(last.x, last.y, 7, 0, Math.PI * 2);
+    ctx.strokeStyle = lineColor + "44";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // ── Y-axis labels ─────────────────────────────────────────────────────
+    ctx.fillStyle  = "#334455";
+    ctx.font       = "9px 'Courier New'";
+    ctx.textAlign  = "left";
+    const topLabel = cfg.invertY
+      ? yMin.toFixed(0)      // top of canvas = low value for invertY
+      : yMax.toFixed(0);
+    const btmLabel = cfg.invertY
+      ? yMax.toFixed(0)
+      : yMin.toFixed(0);
+    ctx.fillText(topLabel, 3, 10);
+    ctx.fillText(btmLabel, 3, H - 3);
+
+  }, [history, cfg, phase]);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={500}
+      height={90}
+      style={{
+        width: "100%",
+        height: "90px",
+        display: "block",
+        borderRadius: 6,
+        border: `1px solid ${cfg.gridColor}`,
+        marginBottom: 10,
+      }}
+    />
+  );
+}
+
+// ── Color helper ─────────────────────────────────────────────────────────────
+function getColor(cfg, value) {
+  if (cfg.higherBad) {
+    if (value >= cfg.critAt) return cfg.critColor;
+    if (value >= cfg.warnAt) return cfg.warnColor;
+    return cfg.goodColor;
+  } else {
+    // lower is bad (bandwidth)
+    if (value <= cfg.critAt) return cfg.critColor;
+    if (value <= cfg.warnAt) return cfg.warnColor;
+    return cfg.goodColor;
+  }
+}
+
+// ── Per-metric card ───────────────────────────────────────────────────────────
+function MetricCard({ cfg, history, phase }) {
+  if (!history.length) return null;
+
+  const vals      = history.map(h => h[cfg.key] ?? 0);
+  const current   = vals[vals.length - 1];
+  const minVal    = Math.min(...vals);
+  const maxVal    = Math.max(...vals);
+  const avgVal    = vals.reduce((a, b) => a + b, 0) / vals.length;
+  const color     = getColor(cfg, current);
+
+  // Spike detection
+  const isSpike = cfg.higherBad
+    ? current >= cfg.critAt
+    : current <= cfg.critAt;
+  const isWarn  = cfg.higherBad
+    ? current >= cfg.warnAt && current < cfg.critAt
+    : current <= cfg.warnAt && current > cfg.critAt;
+
+  const statusLabel = isSpike ? "⚠ CRITICAL" : isWarn ? "! WARNING" : "● NOMINAL";
+  const statusColor = isSpike ? cfg.critColor : isWarn ? cfg.warnColor : cfg.goodColor;
 
   return (
     <div style={{
-      background: "#060e18",
-      border: `1px solid ${valColor}2a`,
-      borderTop: `3px solid ${valColor}`,
-      borderRadius: 10, padding: "14px 16px", marginBottom: 12,
-      boxShadow: `0 0 30px ${valColor}0d`,
-      position: "relative", overflow: "hidden",
+      background: cfg.bgColor,
+      border: `1px solid ${isSpike ? cfg.critColor + "88" : cfg.gridColor}`,
+      borderRadius: 8,
+      padding: "12px 14px",
+      marginBottom: 12,
+      boxShadow: isSpike ? `0 0 12px ${cfg.critColor}33` : "none",
+      transition: "box-shadow 0.3s ease",
     }}>
-      <div style={{
-        position: "absolute", top: 0, right: 0, width: 200, height: 200,
-        background: `radial-gradient(circle at top right, ${valColor}08, transparent 70%)`,
-        pointerEvents: "none",
-      }} />
-
       {/* Header */}
-      <div style={{ display: "flex", justifyContent: "space-between",
-                    alignItems: "flex-start", marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 10 }}>
         <div>
-          <div style={{ fontSize: "11px", fontWeight: 800, letterSpacing: "2.5px",
-                        color: valColor, textShadow: `0 0 10px ${valColor}66` }}>
+          <div style={{ fontSize: "9px", color: "#334455", letterSpacing: "2.5px", marginBottom: 4 }}>
             {cfg.label}
           </div>
-          <div style={{ fontSize: "9px", color: "#334455", letterSpacing: "1px", marginTop: 2 }}>
-            {cfg.description}
+          <div style={{ display: "flex", alignItems: "baseline", gap: 4 }}>
+            <span style={{
+              fontSize: "26px", fontWeight: 900, color,
+              fontFamily: "'Courier New', monospace",
+              textShadow: `0 0 12px ${color}66`,
+              lineHeight: 1,
+            }}>
+              {current.toFixed(1)}
+            </span>
+            <span style={{ fontSize: "11px", color: "#4a6a8a" }}>{cfg.unit}</span>
           </div>
-          <div style={{ fontSize: "9px", color: "#223344", letterSpacing: "1px", marginTop: 1 }}>
-            {directionHint}
-          </div>
+          <div style={{ fontSize: "9px", color: "#2a4a6a", marginTop: 3 }}>{cfg.description}</div>
         </div>
 
-        <div style={{ textAlign: "right" }}>
-          <div style={{ fontSize: "26px", fontWeight: 900, color: valColor,
-                        textShadow: `0 0 16px ${valColor}99`,
-                        fontFamily: "'Courier New',monospace", lineHeight: 1 }}>
-            {latest !== null ? latest.toFixed(1) : "--"}
-            <span style={{ fontSize: "12px", fontWeight: 700, marginLeft: 4 }}>{cfg.unit}</span>
-          </div>
-          <div style={{ marginTop: 4, display: "inline-flex", alignItems: "center", gap: 5,
-                        padding: "2px 8px", background: `${statusColor}18`,
-                        border: `1px solid ${statusColor}44`, borderRadius: 20 }}>
-            <div style={{ width: 5, height: 5, borderRadius: "50%",
-                          background: statusColor, boxShadow: `0 0 6px ${statusColor}`,
-                          animation: statusLabel !== "NOMINAL" ? "blink 0.8s infinite" : "none" }} />
-            <span style={{ fontSize: "9px", fontWeight: 800, letterSpacing: "1.5px",
-                           color: statusColor }}>
+        {/* Status badge */}
+        <div style={{
+          display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4
+        }}>
+          <div style={{
+            background: statusColor + "22",
+            border: `1px solid ${statusColor}55`,
+            borderRadius: 4,
+            padding: "3px 8px",
+            animation: isSpike ? "blink 0.6s infinite" : "none",
+          }}>
+            <span style={{ fontSize: "9px", color: statusColor, fontWeight: 800, letterSpacing: "1px" }}>
               {statusLabel}
             </span>
           </div>
+
+          {/* Change indicator */}
+          {vals.length >= 3 && (() => {
+            const prev = vals[vals.length - 3];
+            const diff = current - prev;
+            const pct  = prev ? Math.abs(diff / prev * 100) : 0;
+            if (pct < 2) return null;
+            const up = diff > 0;
+            const arrowColor = (cfg.higherBad ? up : !up) ? cfg.critColor : cfg.goodColor;
+            return (
+              <div style={{ fontSize: "10px", color: arrowColor, fontWeight: 700 }}>
+                {up ? "▲" : "▼"} {pct.toFixed(0)}%
+              </div>
+            );
+          })()}
         </div>
       </div>
 
-      {/* Canvas */}
-      <canvas ref={canvasRef} style={{
-        width: "100%", height: "90px", display: "block",
-        borderRadius: 6, border: `1px solid ${cfg.gridColor}`, marginBottom: 10,
-      }} />
+      {/* Graph */}
+      <Sparkline history={history} cfg={cfg} phase={phase} />
 
       {/* Stats row */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr",
-                    gap: 6, fontSize: "9px",
-                    borderTop: `1px solid ${cfg.gridColor}`, paddingTop: 8 }}>
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(5, 1fr)",
+        gap: 6,
+        fontSize: "9px",
+        borderTop: `1px solid ${cfg.gridColor}`,
+        paddingTop: 8,
+      }}>
         {[
           ["MIN",  minVal.toFixed(1), null],
           ["AVG",  avgVal.toFixed(1), null],
           ["MAX",  maxVal.toFixed(1), null],
-          // For bandwidth: WARN = drops below 45, CRIT = drops below 15
-          // For others:    WARN = exceeds threshold, CRIT = exceeds threshold
-          ["WARN", cfg.warnAt, cfg.warnColor],
-          ["CRIT", cfg.critAt, cfg.critColor],
+          ["WARN", cfg.warnAt,        cfg.warnColor],
+          ["CRIT", cfg.critAt,        cfg.critColor],
         ].map(([lbl, val, col]) => (
           <div key={lbl} style={{ textAlign: "center" }}>
             <div style={{ color: "#334455", letterSpacing: "1px", marginBottom: 2 }}>{lbl}</div>
-            <div style={{ color: col ?? "#8899aa", fontWeight: 700,
-                          fontFamily: "'Courier New',monospace" }}>
+            <div style={{
+              color: col ?? "#8899aa",
+              fontWeight: 700,
+              fontFamily: "'Courier New', monospace",
+            }}>
               {val}<span style={{ fontSize: "8px", opacity: 0.7 }}>{cfg.unit}</span>
             </div>
           </div>
@@ -339,84 +427,96 @@ function MetricCard({ cfg, points }) {
   );
 }
 
-// ── Network health banner ─────────────────────────────────────────────────────
+// ── Health banner ─────────────────────────────────────────────────────────────
 function HealthBanner({ snapshot, phase }) {
   const phaseColor =
     phase === "attack"    ? "#ff4444" :
     phase === "consensus" ? "#cc88ff" : "#00ff88";
+
   const phaseLabel =
-    phase === "attack"    ? "⚠ ATTACK DETECTED — METRICS DEGRADING" :
-    phase === "consensus" ? "◈ PBFT CONSENSUS — LINKS SATURATED"    :
+    phase === "attack"    ? "⚠ ATTACK ACTIVE — METRICS SPIKING" :
+    phase === "consensus" ? "◈ PBFT CONSENSUS — LINKS SATURATED" :
     "● NOMINAL — ALL LINKS HEALTHY";
 
-  // Health score: penalise each metric proportionally
   let health = 100;
   if (snapshot) {
     METRICS_CONFIG.forEach(cfg => {
       const v = snapshot[cfg.key] ?? 0;
-      let penalty;
-      if (cfg.higherBad) {
-        // Penalty grows as value approaches max
-        penalty = Math.min(v / cfg.max, 1);
-      } else {
-        // Penalty grows as value falls toward 0
-        penalty = 1 - Math.min(v / cfg.max, 1);
-      }
+      const penalty = cfg.higherBad
+        ? Math.min(v / (cfg.critAt * 2), 1)
+        : 1 - Math.min(v / cfg.baselineMax, 1);
       health -= penalty * (100 / METRICS_CONFIG.length);
     });
     health = Math.max(0, Math.round(health));
   }
+
   const healthColor = health > 70 ? "#00ff88" : health > 40 ? "#ffcc00" : "#ff3333";
 
   return (
-    <div style={{ padding: "10px 14px", background: "#060f1e",
-                  borderBottom: "1px solid #0d2137", flexShrink: 0 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between",
-                    padding: "7px 12px", background: `${phaseColor}0d`,
-                    border: `1px solid ${phaseColor}33`, borderRadius: 6, marginBottom: 10 }}>
+    <div style={{
+      background: "#060f1e",
+      border: `1px solid ${phaseColor}33`,
+      borderRadius: 6,
+      padding: "10px 14px",
+      marginBottom: 12,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ width: 8, height: 8, borderRadius: "50%",
-                        background: phaseColor, boxShadow: `0 0 10px ${phaseColor}`,
-                        animation: phase !== "idle" ? "blink 0.8s infinite" : "none" }} />
-          <span style={{ fontSize: "10px", color: phaseColor, fontWeight: 800,
-                         letterSpacing: "1.5px", textShadow: `0 0 8px ${phaseColor}66` }}>
+          <div style={{
+            width: 8, height: 8, borderRadius: "50%",
+            background: phaseColor,
+            boxShadow: `0 0 6px ${phaseColor}`,
+            animation: phase !== "idle" ? "blink 0.8s infinite" : "none",
+          }} />
+          <span style={{ fontSize: "10px", color: phaseColor, fontWeight: 800, letterSpacing: "1.5px" }}>
             {phaseLabel}
           </span>
         </div>
         <div style={{ textAlign: "right" }}>
           <div style={{ fontSize: "8px", color: "#334455", letterSpacing: "1px" }}>NET HEALTH</div>
-          <div style={{ fontSize: "18px", fontWeight: 900, color: healthColor,
-                        textShadow: `0 0 10px ${healthColor}`,
-                        fontFamily: "'Courier New',monospace", lineHeight: 1 }}>
+          <div style={{
+            fontSize: "18px", fontWeight: 900, color: healthColor,
+            textShadow: `0 0 10px ${healthColor}`,
+            fontFamily: "'Courier New', monospace",
+            lineHeight: 1,
+          }}>
             {health}<span style={{ fontSize: "10px" }}>%</span>
           </div>
         </div>
       </div>
       <div style={{ height: 4, background: "#0d2137", borderRadius: 2, overflow: "hidden" }}>
-        <div style={{ height: "100%", width: `${health}%`,
-                      background: `linear-gradient(90deg,${healthColor}88,${healthColor})`,
-                      borderRadius: 2, boxShadow: `0 0 8px ${healthColor}`,
-                      transition: "width 0.4s ease, background 0.4s ease" }} />
+        <div style={{
+          height: "100%",
+          width: `${health}%`,
+          background: `linear-gradient(90deg, ${healthColor}88, ${healthColor})`,
+          borderRadius: 2,
+          boxShadow: `0 0 8px ${healthColor}`,
+          transition: "width 0.4s ease, background 0.4s ease",
+        }} />
       </div>
     </div>
   );
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Main component ────────────────────────────────────────────────────────────
 export default function MetricsGraphs({ edgeMetrics, phase }) {
   const [history,   setHistory]   = useState([]);
   const [activeTab, setActiveTab] = useState("all");
 
   useEffect(() => {
     if (!edgeMetrics || Object.keys(edgeMetrics).length === 0) return;
-    const snap = {
-      bandwidth:   avg(edgeMetrics, "bandwidth"),
-      latency:     avg(edgeMetrics, "latency"),
-      packet_loss: avg(edgeMetrics, "packet_loss"),
-      jitter:      avg(edgeMetrics, "jitter"),
-      rtt:         avg(edgeMetrics, "rtt"),
-    };
-    setHistory(prev => [...prev, snap].slice(-MAX_POINTS));
+
+    // Use weighted average so attack spikes aren't diluted
+    const snap = {};
+    for (const cfg of METRICS_CONFIG) {
+      snap[cfg.key] = weightedAvg(edgeMetrics, cfg.key, cfg.higherBad);
+    }
+
+    setHistory(prev => {
+      const next = [...prev, snap];
+      // During idle, keep a shorter window so baseline is clear
+      return next.slice(-MAX_POINTS);
+    });
   }, [edgeMetrics]);
 
   const TABS = [
@@ -429,33 +529,47 @@ export default function MetricsGraphs({ edgeMetrics, phase }) {
   ];
 
   const visibleMetrics =
-    activeTab === "all" ? METRICS_CONFIG :
-    METRICS_CONFIG.filter(m => m.key === activeTab);
+    activeTab === "all"
+      ? METRICS_CONFIG
+      : METRICS_CONFIG.filter(m => m.key === activeTab);
 
   const latestSnap = history[history.length - 1] ?? null;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%",
-                  overflow: "hidden", fontFamily: "'Courier New',monospace",
-                  background: "#050d1a" }}>
-
-      <div style={{ padding: "12px 14px 0", background: "#060f1e",
-                    borderBottom: "1px solid #0d2137", flexShrink: 0 }}>
-        <div style={{ fontSize: "12px", color: "#44aacc", letterSpacing: "3px",
-                      fontWeight: 800, marginBottom: 10, textShadow: "0 0 10px #44aacc66" }}>
-          NETWORK-WIDE METRICS
+    <div style={{
+      display: "flex",
+      flexDirection: "column",
+      height: "100%",
+      background: "#040d18",
+      fontFamily: "'Courier New', monospace",
+      overflow: "hidden",
+    }}>
+      {/* Header */}
+      <div style={{
+        padding: "10px 14px 6px",
+        borderBottom: "1px solid #0d2137",
+        flexShrink: 0,
+      }}>
+        <div style={{ fontSize: "9px", color: "#4a9aba", letterSpacing: "3px", marginBottom: 8 }}>
+          ◈ LIVE NETWORK METRICS
         </div>
-        <div style={{ display: "flex", gap: 4, marginBottom: 10, flexWrap: "wrap" }}>
+        <HealthBanner snapshot={latestSnap} phase={phase} />
+
+        {/* Tabs */}
+        <div style={{ display: "flex", gap: 4 }}>
           {TABS.map(({ key, label }) => (
             <button key={key} onClick={() => setActiveTab(key)} style={{
-              padding: "5px 9px",
-              background: activeTab === key ? "#1a3a55" : "#08141e",
-              border: `1px solid ${activeTab === key ? "#44aacc" : "#0d2137"}`,
+              flex: 1,
+              padding: "5px 4px",
+              background: activeTab === key ? "#0d2a40" : "#060f1e",
+              border: `1px solid ${activeTab === key ? "#44ccff66" : "#0d2137"}`,
               borderRadius: 4,
-              color: activeTab === key ? "#44ddff" : "#334455",
-              fontSize: "10px", fontWeight: 700, letterSpacing: "1px",
-              cursor: "pointer", fontFamily: "'Courier New',monospace",
-              boxShadow: activeTab === key ? "0 0 8px #44aacc44" : "none",
+              color: activeTab === key ? "#44ccff" : "#2a5a7a",
+              fontSize: "9px",
+              fontWeight: 700,
+              letterSpacing: "1px",
+              cursor: "pointer",
+              fontFamily: "'Courier New', monospace",
               transition: "all 0.15s",
             }}>
               {label}
@@ -464,31 +578,29 @@ export default function MetricsGraphs({ edgeMetrics, phase }) {
         </div>
       </div>
 
-      <HealthBanner snapshot={latestSnap} phase={phase} />
-
-      <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px",
-                    background: "#050d1a" }}>
+      {/* Cards */}
+      <div style={{ flex: 1, overflowY: "auto", padding: "12px 14px" }}>
         {history.length < 2 ? (
-          <div style={{ textAlign: "center", color: "#334455",
-                        fontSize: "12px", marginTop: 40, letterSpacing: "2px" }}>
-            AWAITING NETWORK DATA...
+          <div style={{ textAlign: "center", color: "#1a4a6a", fontSize: "11px", marginTop: 30 }}>
+            Waiting for metrics…
           </div>
         ) : (
           visibleMetrics.map(cfg => (
             <MetricCard
               key={cfg.key}
               cfg={cfg}
-              points={history.map(h => h[cfg.key] ?? 0)}
+              history={history}
+              phase={phase}
             />
           ))
         )}
       </div>
 
       <style>{`
-        @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
-        ::-webkit-scrollbar { width:4px }
-        ::-webkit-scrollbar-track { background:#040d18 }
-        ::-webkit-scrollbar-thumb { background:#1a3a55; border-radius:3px }
+        @keyframes blink {
+          0%,100% { opacity: 1; }
+          50%      { opacity: 0.3; }
+        }
       `}</style>
     </div>
   );

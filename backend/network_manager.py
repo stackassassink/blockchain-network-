@@ -1,10 +1,14 @@
 """
-network_manager.py — Fully decentralised PBFT blockchain simulation.
-Attacks: Byzantine Fault and DoS Flood.
-
-KEY FIX: _simulate_comms now updates ALL edges every tick and emits a
-single "all_edge_metrics" event with the full snapshot. Attack edges
-(near compromised nodes) are always updated so degradation is visible.
+network_manager.py — Self-Healing Secure Network / PBFT Blockchain Simulation
+==============================================================================
+ROOT CAUSE FIXES (v3):
+  1. near_attack now triggers IMMEDIATELY on attack start — no waiting for
+     node status to transition to "compromised" first.
+  2. _attack_edges set is populated the moment an attack is launched so
+     ALL ticks for those edges use attack math from tick 0.
+  3. Bandwidth spikes UP during DoS (flood traffic) then collapses — more
+     physically accurate than a simple drop.
+  4. History buffer phased reset so graphs show sharp transitions.
 """
 
 import time
@@ -20,11 +24,11 @@ REP_DRAIN_DOS   = 8.0
 PBFT_QUORUM     = 0.67
 BLOCK_INTERVAL  = 2.0
 TX_RATE_BASE    = 14
-# Comms tick: update all edges every N seconds
-COMMS_TICK_IDLE      = 1.5   # seconds between full-network metric updates (idle)
-COMMS_TICK_ATTACK    = 0.8   # faster during attack so degradation shows instantly
-COMMS_TICK_CONSENSUS = 1.2
-ATTACK_SECS     = 5
+
+COMMS_TICK_IDLE      = 1.5
+COMMS_TICK_ATTACK    = 0.6   # faster ticks during attack → graph updates quickly
+COMMS_TICK_CONSENSUS = 1.0
+ATTACK_SECS          = 5
 
 PEER_MESSAGES = [
     "Block #{block} propagated {node} → {peer}",
@@ -42,12 +46,30 @@ PEER_MESSAGES = [
 ]
 
 
-# ── EdgeMetrics ───────────────────────────────────────────────────────────────
+# ── helpers ───────────────────────────────────────────────────────────────────
+def _avg(lst, key):
+    vals = [v[key] for v in lst if key in v]
+    return sum(vals) / len(vals) if vals else 0.0
 
+
+# ── EdgeMetrics ───────────────────────────────────────────────────────────────
 class EdgeMetrics:
     """
-    Tracks live network metrics for one edge.
-    Latency, Bandwidth, Jitter, Round-Trip Time, Packet Loss.
+    Per-edge live metrics with physically realistic attack behaviour.
+
+    DoS flood:
+      • First 2 ticks: bandwidth SPIKES (flood traffic) then COLLAPSES
+      • Latency shoots up (queue saturation)
+      • Packet loss soars (buffers overflow)
+
+    Byzantine fault:
+      • Bandwidth drops moderately (retransmissions)
+      • Latency rises (double-spend detection overhead)
+      • Packet loss rises (conflicting blocks rejected)
+
+    Consensus phase:
+      • Bandwidth drops (message passing saturates link)
+      • Latency elevated (multi-round voting)
     """
 
     def __init__(self, source: str, target: str):
@@ -65,67 +87,89 @@ class EdgeMetrics:
         self.bytes_sent       = 0
         self._latency_history = deque(maxlen=12)
         self._latency_history.append(self.base_latency)
+        self._tick            = 0          # counts attack ticks for burst model
+
+    def reset_to_idle(self):
+        """Snap back to baseline when network heals."""
+        self.latency     = self.base_latency + random.uniform(0, 4)
+        self.bandwidth   = self.base_bandwidth + random.uniform(-5, 8)
+        self.packet_loss = random.uniform(0, 0.5)
+        self.jitter      = random.uniform(1, 4)
+        self.rtt         = self.latency * 2
+        self._tick       = 0
+        self._latency_history.clear()
+        self._latency_history.append(self.latency)
 
     def update(self, phase: str, near_attack: bool, attack_type: str = None):
         """Recalculate all metrics. Called every tick regardless of node status."""
         self.message_count += 1
         self.bytes_sent    += random.randint(512, 8192)
+        self._tick         += 1
 
         if phase == "idle":
-            self.latency      = self.base_latency + random.uniform(-2, 6)
-            self.bandwidth    = self.base_bandwidth + random.uniform(-8, 10)
-            self.packet_loss  = random.uniform(0, 0.8)
+            # Natural small fluctuations
+            self.latency     = self.base_latency  + random.uniform(-2,  6)
+            self.bandwidth   = self.base_bandwidth + random.uniform(-8, 10)
+            self.packet_loss = random.uniform(0, 0.8)
+            self._tick       = 0
 
         elif phase == "attack":
             if near_attack:
                 if attack_type == "dos":
-                    self.latency     = self.base_latency * random.uniform(6, 16)
-                    self.bandwidth   = self.base_bandwidth * random.uniform(0.02, 0.15)
-                    self.packet_loss = random.uniform(30, 70)
+                    # ── DoS / DDoS flood ──────────────────────────────────
+                    # Tick 0-1: Bandwidth SPIKES (flood traffic arriving)
+                    # Tick 2+ : Bandwidth COLLAPSES (queues saturated, drops)
+                    if self._tick <= 2:
+                        bw_mult = random.uniform(1.8, 3.2)   # initial spike
+                    else:
+                        bw_mult = random.uniform(0.02, 0.12) # collapse
+                    self.latency     = self.base_latency * random.uniform(7, 18)
+                    self.bandwidth   = self.base_bandwidth * bw_mult
+                    self.packet_loss = random.uniform(35, 75)
+
                 elif attack_type == "byzantine":
-                    self.latency     = self.base_latency * random.uniform(2, 5)
-                    self.bandwidth   = self.base_bandwidth * random.uniform(0.40, 0.75)
-                    self.packet_loss = random.uniform(8, 25)
+                    # ── Byzantine / Double-spend ──────────────────────────
+                    self.latency     = self.base_latency * random.uniform(2.5, 6)
+                    self.bandwidth   = self.base_bandwidth * random.uniform(0.35, 0.70)
+                    self.packet_loss = random.uniform(10, 30)
+
                 else:
-                    self.latency     = self.base_latency * random.uniform(3, 8)
-                    self.bandwidth   = self.base_bandwidth * random.uniform(0.20, 0.55)
-                    self.packet_loss = random.uniform(15, 45)
+                    # Generic / Eclipse / Sybil
+                    self.latency     = self.base_latency * random.uniform(3, 9)
+                    self.bandwidth   = self.base_bandwidth * random.uniform(0.15, 0.50)
+                    self.packet_loss = random.uniform(20, 55)
             else:
-                # Indirect congestion — still visibly worse than idle
-                self.latency     = self.base_latency * random.uniform(1.3, 2.5)
-                self.bandwidth   = self.base_bandwidth * random.uniform(0.70, 0.95)
-                self.packet_loss = random.uniform(1, 8)
+                # Indirect congestion — still noticeably worse than idle
+                self.latency     = self.base_latency * random.uniform(1.4, 2.8)
+                self.bandwidth   = self.base_bandwidth * random.uniform(0.65, 0.90)
+                self.packet_loss = random.uniform(1.5, 10)
 
         elif phase == "consensus":
-            self.latency     = self.base_latency * random.uniform(2.5, 5.5)
-            self.bandwidth   = self.base_bandwidth * random.uniform(0.20, 0.45)
-            self.packet_loss = random.uniform(3, 12)
+            # PBFT message storm saturates links
+            self.latency     = self.base_latency * random.uniform(2.5, 6)
+            self.bandwidth   = self.base_bandwidth * random.uniform(0.18, 0.42)
+            self.packet_loss = random.uniform(3, 14)
+            self._tick       = 0
 
-        # Clamp
-        self.latency     = round(max(1.0,  min(self.latency,    2500.0)), 1)
-        self.bandwidth   = round(max(0.1,  min(self.bandwidth,   200.0)), 1)
+        # ── Hard clamps ───────────────────────────────────────────────────
+        self.latency     = round(max(1.0,  min(self.latency,    3000.0)), 1)
+        self.bandwidth   = round(max(0.05, min(self.bandwidth,   350.0)), 1)
         self.packet_loss = round(max(0.0,  min(self.packet_loss,  99.0)), 1)
 
         # Jitter = mean absolute deviation of recent latency readings
         self._latency_history.append(self.latency)
         if len(self._latency_history) > 1:
             readings = list(self._latency_history)
-            avg = sum(readings) / len(readings)
+            avg_lat  = sum(readings) / len(readings)
             self.jitter = round(
-                sum(abs(x - avg) for x in readings) / len(readings), 1
+                sum(abs(r - avg_lat) for r in readings) / len(readings), 1
             )
+        else:
+            self.jitter = round(random.uniform(1, 4), 1)
 
-        self.rtt = round((self.latency * 2) + random.uniform(0.5, 4.0), 1)
-
-    def health_score(self) -> float:
-        lat_score    = max(0, 100 - (self.latency / 25))
-        bw_score     = (self.bandwidth / self.base_bandwidth) * 100
-        loss_score   = max(0, 100 - (self.packet_loss * 3))
-        jitter_score = max(0, 100 - (self.jitter * 4))
-        return round(
-            lat_score * 0.35 + bw_score * 0.30 +
-            loss_score * 0.25 + jitter_score * 0.10, 1
-        )
+        # RTT = round-trip (latency + small ack overhead)
+        ack_overhead = random.uniform(0.8, 1.3)
+        self.rtt = round(self.latency * 2 * ack_overhead, 1)
 
     def to_dict(self) -> dict:
         return {
@@ -137,613 +181,380 @@ class EdgeMetrics:
             "jitter":        self.jitter,
             "rtt":           self.rtt,
             "packet_loss":   self.packet_loss,
-            "health":        self.health_score(),
             "message_count": self.message_count,
             "bytes_sent":    self.bytes_sent,
         }
 
 
 # ── Node ──────────────────────────────────────────────────────────────────────
-
 class Node:
     def __init__(self, node_id: str):
-        self.id              = node_id
-        self.type            = "validator"
-        self.status          = "healthy"
-        self.reputation      = INITIAL_REP
-        self.is_primary      = False
-        self.blockchain      = []
-        self.block_count     = 0
-        self.connected_peers = []
-        self.last_seen       = time.time()
-        self.attack_type     = None
-        self._add_genesis()
-
-    def _add_genesis(self):
-        self.blockchain.append({
-            "index":         0,
-            "timestamp":     datetime.utcnow().isoformat(),
-            "transactions":  [],
-            "previous_hash": "0" * 64,
-            "hash":          f"genesis_{self.id}",
-            "proposer":      self.id,
-            "round":         0,
-        })
-        self.block_count = 1
-
-    def add_block(self, tx_count: int, round_num: int):
-        prev  = self.blockchain[-1]
-        block = {
-            "index":         len(self.blockchain),
-            "timestamp":     datetime.utcnow().isoformat(),
-            "transactions":  [
-                {
-                    "tx_id":  f"tx_{random.randint(10000,99999)}",
-                    "amount": round(random.uniform(0.1, 10.0), 4),
-                    "from":   f"addr_{random.randint(100,999)}",
-                    "to":     f"addr_{random.randint(100,999)}",
-                }
-                for _ in range(tx_count)
-            ],
-            "previous_hash": prev["hash"],
-            "hash":          f"{self.id}_{len(self.blockchain)}_{random.randint(100000,999999)}",
-            "proposer":      self.id,
-            "round":         round_num,
-        }
-        self.blockchain.append(block)
-        self.block_count += 1
-        return block
-
-    def drain_reputation(self, amount: float):
-        self.reputation = max(0.0, self.reputation - amount)
-
-    def restore(self):
-        self.reputation  = INITIAL_REP
+        self.id          = node_id
         self.status      = "healthy"
+        self.reputation  = INITIAL_REP
         self.attack_type = None
-        self.is_primary  = False
-        self.type        = "validator"
+        self.chain       = []
+        self.peers       = []
+        self._genesis()
 
-    def to_dict(self) -> dict:
-        return {
-            "id":              self.id,
-            "type":            self.type,
-            "status":          self.status,
-            "reputation":      round(self.reputation, 1),
-            "is_primary":      self.is_primary,
-            "block_count":     self.block_count,
-            "connected_peers": self.connected_peers,
-            "attack_type":     self.attack_type,
-            "last_seen":       self.last_seen,
+    def _genesis(self):
+        self.chain.append({
+            "index": 0, "timestamp": datetime.utcnow().isoformat(),
+            "data": "Genesis Block", "previous_hash": "0" * 64,
+            "hash": "genesis_" + self.id,
+        })
+
+    def mine_block(self, transactions: list) -> dict:
+        prev  = self.chain[-1]
+        block = {
+            "index":         len(self.chain),
+            "timestamp":     datetime.utcnow().isoformat(),
+            "transactions":  transactions,
+            "previous_hash": prev["hash"],
+            "hash":          f"{self.id}_block_{len(self.chain)}_{random.randint(1000,9999)}",
+            "miner":         self.id,
         }
+        self.chain.append(block)
+        return block
 
 
 # ── NetworkManager ────────────────────────────────────────────────────────────
-
 class NetworkManager:
+    """
+    Orchestrates the 7-node PBFT network, attack simulation,
+    self-healing, and real-time metric emission.
+    """
 
-    def __init__(self):
-        self._lock              = threading.Lock()
-        self._pbft_cancel       = threading.Event()
-        self.nodes              = {}
-        self.edges              = []
-        self.edge_metrics       = {}
-        self.emit_cb            = None
-        self._block_timer       = None
-        self._comms_timer       = None
-        self._tx_rate           = TX_RATE_BASE
-        self._total_blocks      = 0
-        self._round             = 0
-        self._primary_idx       = 0
-        self._attack_active     = False
-        self._paused            = False
-        self._compromised_nodes = set()
-        self._phase             = "idle"
+    TOPOLOGY = {
+        "N1": ["N2", "N3", "N4"],
+        "N2": ["N1", "N3", "N5"],
+        "N3": ["N1", "N2", "N6"],
+        "N4": ["N1", "N5", "N7"],
+        "N5": ["N2", "N4", "N6"],
+        "N6": ["N3", "N5", "N7"],
+        "N7": ["N4", "N6"],
+    }
 
-        self._build_network()
-        self._start_miner()
-        self._start_comms()
+    def __init__(self, emit_fn: Callable):
+        self._emit      = emit_fn
+        self._lock      = threading.Lock()
+        self._running   = False
+        self._paused    = False
+        self._phase     = "idle"
 
-    def _build_network(self):
-        for nid in ["N1","N2","N3","N4","N5","N6","N7"]:
-            self.nodes[nid] = Node(nid)
+        # FIX: track which edges are "near attack" immediately on launch
+        self._attack_node_ids: set = set()
 
-        pairs = [
-            ("N1","N2"),("N1","N3"),("N1","N4"),
-            ("N2","N3"),("N2","N5"),
-            ("N3","N6"),
-            ("N4","N5"),("N4","N7"),
-            ("N5","N6"),
-            ("N6","N7"),
-        ]
-        for a, b in pairs:
-            self.edges.append({"source": a, "target": b, "active": True})
-            self.nodes[a].connected_peers.append(b)
-            self.nodes[b].connected_peers.append(a)
-            self.edge_metrics[f"{a}-{b}"] = EdgeMetrics(a, b)
+        self._primary_idx   = 0
+        self._total_blocks  = 0
+        self._attack_timer  = None
 
-        self._update_primary()
-        self._emit_log("🟢 Decentralised network online — 7 validators, 10 edges", "success")
-        self._emit_log("🔄 Primary rotates round-robin — no permanent leader", "info")
+        self.nodes: dict[str, Node] = {
+            nid: Node(nid) for nid in self.TOPOLOGY
+        }
+        for nid, peers in self.TOPOLOGY.items():
+            self.nodes[nid].peers = peers
 
-    def _healthy_nodes(self):
-        return [n for n in self.nodes.values() if n.status == "healthy"]
+        self.edges: list[dict] = []
+        self.edge_metrics: dict[str, EdgeMetrics] = {}
+        self._build_edges()
 
-    def _update_primary(self):
-        healthy = self._healthy_nodes()
-        if not healthy:
-            return None
-        for n in self.nodes.values():
-            n.is_primary = False
-            if n.type == "primary":
-                n.type = "validator"
-        self._primary_idx = self._primary_idx % len(healthy)
-        p = healthy[self._primary_idx]
-        p.is_primary = True
-        p.type = "primary"
-        return p
+    # ── init ─────────────────────────────────────────────────────────────────
+    def _build_edges(self):
+        seen = set()
+        for src, peers in self.TOPOLOGY.items():
+            for tgt in peers:
+                key = tuple(sorted([src, tgt]))
+                if key not in seen:
+                    seen.add(key)
+                    self.edges.append({"source": src, "target": tgt, "active": True})
+                    fwd = f"{src}-{tgt}"
+                    rev = f"{tgt}-{src}"
+                    self.edge_metrics[fwd] = EdgeMetrics(src, tgt)
+                    self.edge_metrics[rev] = EdgeMetrics(tgt, src)
 
-    # ── Miner ─────────────────────────────────────────────────────────────
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+    def start(self):
+        self._running = True
+        threading.Thread(target=self._block_loop,  daemon=True).start()
+        threading.Thread(target=self._comms_loop,  daemon=True).start()
 
-    def _start_miner(self):
-        self._schedule_mine()
+    def stop(self):
+        self._running = False
 
-    def _schedule_mine(self):
-        if self._paused:        
-            return
-        t = threading.Timer(BLOCK_INTERVAL, self._mine_block)
-        t.daemon = True
-        self._block_timer = t
-        t.start()
+    def pause(self):
+        self._paused = True
+        self._set_phase("paused")
 
-    def _mine_block(self):
-        proposer_id = None
-        block_num   = 0
-        tx_count    = 0
+    def resume(self):
+        self._paused = False
+        self._set_phase("idle")
 
+    # ── public API ────────────────────────────────────────────────────────────
+    def launch_attack(self, attack_type: str, target_id: str):
+        """
+        CRITICAL FIX: populate _attack_node_ids IMMEDIATELY so the very
+        first comms tick uses attack math — no waiting for reputation drain.
+        """
         with self._lock:
-            healthy = self._healthy_nodes()
-            if healthy:
-                primary = next((n for n in healthy if n.is_primary), healthy[0])
-                tx_count           = random.randint(3, 8)
-                self._round       += 1
-                primary.add_block(tx_count=tx_count, round_num=self._round)
-                self._total_blocks += 1
-                self._tx_rate      = TX_RATE_BASE + random.randint(-2, 6)
-                proposer_id        = primary.id
-                block_num          = self._total_blocks
-                self._primary_idx  = (self._primary_idx + 1) % len(healthy)
-                for n in healthy:
-                    n.is_primary = False
-                    n.type       = "validator"
-                nxt            = healthy[self._primary_idx % len(healthy)]
-                nxt.is_primary = True
-                nxt.type       = "primary"
+            node = self.nodes.get(target_id)
+            if not node or node.status != "healthy":
+                return {"error": "Target unavailable"}
 
-        if proposer_id:
-            self._emit_log(
-                f"⛏  Block #{block_num} by {proposer_id} | "
-                f"{tx_count} txs | {self._tx_rate} tx/s | round {self._round}",
-                "block"
-            )
+            node.status      = "compromised"
+            node.attack_type = attack_type
 
-        state = self._full_state()
-        self._emit("graph_update", {"nodes": state["nodes"], "edges": state["edges"]})
-        self._emit("stats_update", {
-            "block_count":       state["block_count"],
-            "tx_rate":           state["tx_rate"],
-            "attack_active":     state["attack_active"],
-            "compromised_nodes": state["compromised_nodes"],
+            # Immediately mark all neighbour edges as "near attack"
+            self._attack_node_ids = {target_id} | set(self.TOPOLOGY.get(target_id, []))
+
+            self._set_phase("attack")
+
+        self._emit("attack_started", {
+            "target": target_id, "type": attack_type,
+            "timestamp": datetime.utcnow().isoformat(),
         })
-        self._schedule_mine()
+        self._emit_log(
+            f"⚡ ATTACK LAUNCHED: {attack_type.upper()} on {target_id}", "error"
+        )
 
-    # ── Comms tick — THE KEY FIX ───────────────────────────────────────────
-    # OLD: picked one random edge, skipped compromised nodes
-    # NEW: updates ALL edges every tick, attack edges get degraded values
+        if self._attack_timer:
+            self._attack_timer.cancel()
+        self._attack_timer = threading.Timer(ATTACK_SECS, self._detect_and_heal)
+        self._attack_timer.start()
+        return {"status": "attack_launched", "target": target_id, "type": attack_type}
 
-    def _start_comms(self):
-        self._schedule_comms()
+    def reset(self):
+        with self._lock:
+            if self._attack_timer:
+                self._attack_timer.cancel()
+                self._attack_timer = None
+            self._attack_node_ids = set()
+            for node in self.nodes.values():
+                node.status      = "healthy"
+                node.reputation  = INITIAL_REP
+                node.attack_type = None
+            for edge in self.edges:
+                edge["active"] = True
+            for em in self.edge_metrics.values():
+                em.reset_to_idle()
+            self._set_phase("idle")
 
-    def _schedule_comms(self):
-        if self._paused:        
-            return
-        if self._phase == "attack":
-            delay = COMMS_TICK_ATTACK
-        elif self._phase == "consensus":
-            delay = COMMS_TICK_CONSENSUS
-        else:
-            delay = COMMS_TICK_IDLE + random.uniform(-0.2, 0.3)
+        self._emit_log("🔄 Network reset — all nodes restored", "info")
+        self._emit_graph()
+        return {"status": "reset"}
 
-        t = threading.Timer(delay, self._simulate_comms)
-        t.daemon = True
-        self._comms_timer = t
-        t.start()
+    def heal(self):
+        suspects = [n for n in self.nodes.values() if n.status in ("compromised", "suspect")]
+        if not suspects:
+            return {"status": "no_suspects"}
+        for node in suspects:
+            self._quarantine(node.id)
+        return {"status": "healed", "quarantined": [n.id for n in suspects]}
 
+    def get_state(self) -> dict:
+        with self._lock:
+            return {
+                "nodes": self._node_list(),
+                "edges": self.edges,
+                "phase": self._phase,
+                "stats": self._stats(),
+            }
+
+    def get_metrics(self) -> dict:
+        return {k: v.to_dict() for k, v in self.edge_metrics.items()}
+
+    def get_chain(self, node_id: str) -> list:
+        node = self.nodes.get(node_id)
+        return node.chain if node else []
+
+    # ── internal loops ────────────────────────────────────────────────────────
+    def _block_loop(self):
+        while self._running:
+            time.sleep(BLOCK_INTERVAL)
+            if self._paused:
+                continue
+            with self._lock:
+                self._mine_round()
+
+    def _comms_loop(self):
+        while self._running:
+            tick_delay = (
+                COMMS_TICK_ATTACK    if self._phase == "attack"    else
+                COMMS_TICK_CONSENSUS if self._phase == "consensus" else
+                COMMS_TICK_IDLE
+            )
+            time.sleep(tick_delay)
+            if self._paused:
+                continue
+            self._simulate_comms()
+
+    # ── mining ────────────────────────────────────────────────────────────────
+    def _mine_round(self):
+        primaries = list(self.TOPOLOGY.keys())
+        primary_id = primaries[self._primary_idx % len(primaries)]
+        self._primary_idx += 1
+        primary = self.nodes[primary_id]
+
+        n_tx = random.randint(3, 8)
+        txs  = [{"id": f"tx_{self._total_blocks}_{i}", "value": random.randint(1, 100)}
+                for i in range(n_tx)]
+
+        if primary.status == "compromised" and primary.attack_type == "byzantine":
+            # Byzantine: forge conflicting hashes
+            primary.mine_block(txs)
+            self._emit_log(
+                f"⚠ Byzantine block from {primary_id} — conflicting hashes broadcast", "warning"
+            )
+        elif primary.status not in ("quarantined",):
+            block = primary.mine_block(txs)
+            # Replicate to peers
+            for peer_id in primary.peers:
+                peer = self.nodes.get(peer_id)
+                if peer and peer.status not in ("quarantined",):
+                    peer.mine_block(txs)
+
+        self._total_blocks += 1
+        self._drain_reputation()
+        self._emit("stats_update", self._stats())
+
+    def _drain_reputation(self):
+        changed = False
+        for node in self.nodes.values():
+            if node.status == "compromised":
+                drain = REP_DRAIN_BYZ if node.attack_type == "byzantine" else REP_DRAIN_DOS
+                node.reputation = max(0.0, node.reputation - drain)
+                if node.reputation < 30 and node.status == "compromised":
+                    node.status = "suspect"
+                    self._emit("anomaly_detected", {"node": node.id})
+                    self._emit_log(f"🔍 Anomaly detected on {node.id} (rep={node.reputation:.0f})", "warning")
+                changed = True
+        if changed:
+            self._emit_graph()
+
+    # ── comms / metrics ───────────────────────────────────────────────────────
     def _simulate_comms(self):
         with self._lock:
-            compromised = {
-                nid for nid, n in self.nodes.items()
-                if n.status in ("compromised", "quarantined")
-            }
+            phase       = self._phase
             attack_type = None
-            for nid in compromised:
+
+            # Determine attack_type from any compromised node
+            for nid in self._attack_node_ids:
                 nd = self.nodes.get(nid)
                 if nd and nd.attack_type:
                     attack_type = nd.attack_type
                     break
-            block_num = self._total_blocks
-            phase     = self._phase
 
-            # ── Update ALL edges every tick ────────────────────────────────
+            # FIX: use _attack_node_ids (set immediately on launch)
+            # instead of scanning node.status (lags by several ticks)
             all_metrics = {}
             for edge in self.edges:
                 src = edge["source"]
                 tgt = edge["target"]
                 key = f"{src}-{tgt}"
 
-                # An edge is "near attack" if either endpoint is compromised
-                near = (src in compromised or tgt in compromised)
+                near = (src in self._attack_node_ids or tgt in self._attack_node_ids)
 
-                metrics = self.edge_metrics.get(key)
-                if metrics:
-                    metrics.update(
-                        phase=phase,
-                        near_attack=near,
-                        attack_type=attack_type
-                    )
-                    all_metrics[key] = metrics.to_dict()
+                em = self.edge_metrics.get(key)
+                if em:
+                    em.update(phase=phase, near_attack=near, attack_type=attack_type)
+                    all_metrics[key] = em.to_dict()
 
-        # Emit one event with the FULL metrics snapshot
-        # Frontend receives all 10 edges at once → accurate averages immediately
         if all_metrics:
             self._emit("all_edge_metrics", all_metrics)
 
-        # One representative log line
-        if all_metrics:
-            vals = list(all_metrics.values())
-            sample = random.choice(vals)
-            src, tgt = sample["source"], sample["target"]
-
-            if phase == "attack" and compromised:
-                near_samples = [v for v in vals
-                                if v["source"] in compromised or v["target"] in compromised]
-                if near_samples:
-                    worst = max(near_samples, key=lambda v: v["latency"])
+            # Log the worst edge during attack
+            if phase == "attack":
+                vals = list(all_metrics.values())
+                near_vals = [v for v in vals
+                             if v["source"] in self._attack_node_ids
+                             or v["target"] in self._attack_node_ids]
+                if near_vals:
+                    worst = max(near_vals, key=lambda v: v["latency"])
                     self._emit_log(
                         f"⚡ {worst['source']}→{worst['target']} | "
-                        f"lat={worst['latency']}ms rtt={worst['rtt']}ms "
-                        f"bw={worst['bandwidth']}Mbps loss={worst['packet_loss']}% | DEGRADED",
-                        "warning"
+                        f"lat={worst['latency']}ms bw={worst['bandwidth']:.1f}Mbps "
+                        f"loss={worst['packet_loss']}% | LINK DEGRADED",
+                        "warning",
                     )
-                else:
-                    self._emit_log(
-                        f"🔍 anomaly scan | avg-lat={_avg(vals,'latency'):.1f}ms "
-                        f"avg-loss={_avg(vals,'packet_loss'):.1f}%", "warning"
-                    )
-            else:
-                msg = random.choice(PEER_MESSAGES).format(
-                    node=src, peer=tgt,
-                    block=block_num, tx=random.randint(1, 9), lat=round(sample["latency"])
-                )
-                self._emit_log(
-                    f"{msg} | lat={sample['latency']}ms rtt={sample['rtt']}ms "
-                    f"bw={sample['bandwidth']}Mbps jitter={sample['jitter']}ms",
-                    "info"
-                )
 
-        self._schedule_comms()
+    # ── healing / PBFT ────────────────────────────────────────────────────────
+    def _detect_and_heal(self):
+        self._set_phase("consensus")
+        self._emit_log("🔐 PBFT consensus initiated — voting on quarantine", "info")
+        threading.Timer(3.0, self._pbft_commit).start()
 
-    # ── Public API ────────────────────────────────────────────────────────
-
-    def get_network_state(self):
-        with self._lock:
-            return self._full_state()
-
-    def get_chain(self, node_id):
-        with self._lock:
-            node = self.nodes.get(node_id)
-            if not node:
-                return {"error": f"Node {node_id} not found"}
-            return {"node_id": node_id, "block_count": node.block_count,
-                    "chain": node.blockchain}
-
-    def get_metrics(self):
-        with self._lock:
-            return {k: v.to_dict() for k, v in self.edge_metrics.items()}
-
-    def trigger_attack(self, attack_type: str, target_id: str):
-        if attack_type not in ("byzantine", "dos"):
-            attack_type = "byzantine"
-        with self._lock:
-            node = self.nodes.get(target_id)
-            if not node:
-                return {"error": f"Node {target_id} not found"}
-            if node.status == "quarantined":
-                return {"error": f"{target_id} already quarantined"}
-            node.status         = "compromised"
-            node.attack_type    = attack_type
-            node.type           = "compromised"
-            node.is_primary     = False
-            self._compromised_nodes.add(target_id)
-            self._attack_active = True
-            self._phase         = "attack"
-
-        self._emit("attack_started", {"type": attack_type, "target_id": target_id,
-                                      "timestamp": _ts()})
-        self._emit("phase_change", {"phase": "attack"})
-        self._emit_log(
-            f"🚨 {attack_type.upper()} ATTACK on {target_id} — node compromised!", "error"
-        )
-        self._push_update()
-        threading.Thread(
-            target=self._attack_then_pbft, args=(attack_type, target_id), daemon=True
-        ).start()
-        return {"status": "attack_started", "type": attack_type, "target": target_id}
-
-    def trigger_heal(self):
-        with self._lock:
-            suspects = [nid for nid, n in self.nodes.items()
-                        if n.status in ("suspect", "compromised")]
-        for nid in suspects:
-            threading.Thread(target=self._pbft_round, args=(nid,), daemon=True).start()
-        return {"status": "healing_started", "targets": suspects}
-
-    def reset_network(self):
-        if self._block_timer:  self._block_timer.cancel()
-        if self._comms_timer:  self._comms_timer.cancel()
-        with self._lock:
-            for node in self.nodes.values():
-                node.restore()
-            for edge in self.edges:
-                edge["active"] = True
-            for key in list(self.edge_metrics.keys()):
-                parts = key.split("-")
-                self.edge_metrics[key] = EdgeMetrics(parts[0], parts[1])
-            self._compromised_nodes.clear()
-            self._attack_active  = False
-            self._total_blocks   = 0
-            self._round          = 0
-            self._primary_idx    = 0
-            self._phase          = "idle"
-            self.nodes["N1"].is_primary = True
-            self.nodes["N1"].type       = "primary"
-
-        self._push_update()
-        self._emit("phase_change", {"phase": "idle"})
-        self._emit_log("🔄 NETWORK RESET — 7 validators restored", "success")
-        self._start_miner()
-        self._start_comms()
-        return {"status": "reset_complete"}
-    
-    def pause_network(self):
-        with self._lock:
-            if self._paused:
-                return {"status": "already_paused"}
-            self._paused = True
-            self._phase  = "paused"
-
-        if self._block_timer:
-            self._block_timer.cancel()
-        if self._comms_timer:
-            self._comms_timer.cancel()
-
-        self._emit("phase_change", {"phase": "paused"})
-        self._emit_log("⏸  NETWORK PAUSED — all simulation timers halted", "warning")
-        self._push_update()
-        return {"status": "paused"}
-
-    def resume_network(self):
-        with self._lock:
-            if not self._paused:
-                return {"status": "not_paused"}
-            self._paused = False
-            self._phase  = "idle"
-
-        self._emit("phase_change", {"phase": "idle"})
-        self._emit_log("▶  NETWORK RESUMED — simulation restarted", "success")
-        self._push_update()
-        self._start_miner()
-        self._start_comms()
-        return {"status": "resumed"}
-
-    # ── Attack sequence ───────────────────────────────────────────────────
-
-    def _attack_then_pbft(self, attack_type: str, target_id: str):
-        drain = REP_DRAIN_BYZ if attack_type == "byzantine" else REP_DRAIN_DOS
-        delay = ATTACK_SECS / 5
-        for step in range(5):
-            time.sleep(delay)
-            with self._lock:
-                node = self.nodes.get(target_id)
-                if not node or node.status == "quarantined":
-                    return
-                node.drain_reputation(drain * (0.5 if step < 2 else 1.0))
-                rep    = node.reputation
-                hash_a = f"{random.randint(0xa000,0xffff):04x}{random.randint(0,0xffff):04x}"
-                hash_b = f"{random.randint(0xa000,0xffff):04x}{random.randint(0,0xffff):04x}"
-            self._emit("anomaly_detected", {"node_id": target_id,
-                "reason": f"{attack_type} behaviour", "rep_score": round(rep, 1)})
-            self._push_update()
-            if attack_type == "byzantine":
-                self._emit_log(
-                    f"⚠  {target_id} | expected={hash_a} got={hash_b} | "
-                    f"rep={round(rep,1)} | CONFLICTING BLOCK HASH", "warning"
-                )
-            else:
-                self._emit_log(
-                    f"⚠  {target_id} | tx_flood | rep={round(rep,1)} | "
-                    f"BANDWIDTH SATURATED", "warning"
-                )
-        self._emit_log(
-            f"🤖 Anomaly confirmed — PBFT triggered for {target_id}", "error"
-        )
-        time.sleep(0.4)
-        self._phase = "consensus"
-        self._emit("phase_change", {"phase": "consensus"})
-        self._pbft_round(target_id)
-
-    # ── PBFT ──────────────────────────────────────────────────────────────
-
-    def _pbft_round(self, target_id: str):
-        self._pbft_cancel.clear()
-        with self._lock:
-            voters = [nid for nid, n in self.nodes.items()
-                    if nid != target_id and n.status == "healthy"]
-            total = len(voters)
-        if total == 0:
-            return
-        quorum = int(total * PBFT_QUORUM) + 1
-        random.shuffle(voters)
-
-        accuser = voters[0]
-        self._emit_log(f"📡 PRE-PREPARE: {accuser} broadcasts accusation → {target_id}", "info")
-        self._emit_log(f"   {total} validators initiating verification", "info")
-
-        for _ in range(4):
-            if self._pbft_cancel.is_set(): return
-            time.sleep(0.1)
-
-        prepare_acks = 0
-        self._emit_log(f"📋 PREPARE: validators cross-checking {target_id}", "info")
-        for vid in voters:
-            if self._pbft_cancel.is_set(): return
-            time.sleep(0.2)
-            ack = random.random() < 0.92
-            if ack:
-                prepare_acks += 1
-            self._emit_log(
-                f"  {'✔' if ack else '✘'} {vid} prepare-ack | {prepare_acks}/{total}", "info"
-            )
-
-        if prepare_acks < quorum:
-            self._emit_log(f"⚠  Prepare failed — {target_id} marked SUSPECT", "warning")
-            with self._lock:
-                node = self.nodes.get(target_id)
-                if node and node.status != "quarantined":
-                    node.status = "suspect"
-            self._phase = "idle"
-            self._emit("phase_change", {"phase": "idle"})
-            self._push_update()
-            return
-
-        self._emit_log(f"🔐 COMMIT: {prepare_acks} validators committing verdict on {target_id}", "info")
-        commit_votes = 0
-        for vid in voters:
-            if self._pbft_cancel.is_set(): return
-            time.sleep(0.3)
-            vote = "quarantine" if random.random() < 0.88 else "abstain"
-            if vote == "quarantine":
-                commit_votes += 1
-            self._emit("vote_cast", {"voter_id": vid, "target_id": target_id,
-                "vote": vote, "count": commit_votes, "total": total})
-            self._emit("consensus_votes", {target_id: {
-                "count": commit_votes, "total": total,
-                "needed": quorum, "vote": vote}})
-            self._emit_log(
-                f"  {'✅' if vote=='quarantine' else '⬜'} {vid} → {vote.upper()} | {commit_votes}/{quorum}",
-                "info"
-            )
-            if commit_votes >= quorum:
-                if not self._pbft_cancel.is_set():
-                    self._quarantine(target_id)
-                return
-
-        if not self._pbft_cancel.is_set():
-            with self._lock:
-                node = self.nodes.get(target_id)
-                if node and node.status != "quarantined":
-                    node.status = "suspect"
-            self._phase = "idle"
-            self._emit("phase_change", {"phase": "idle"})
-            self._push_update()
-            self._emit_log(f"⚠  Commit quorum not reached — {target_id} SUSPECT", "warning")
-
-    # ── Quarantine ────────────────────────────────────────────────────────
+    def _pbft_commit(self):
+        suspects = [n for n in self.nodes.values() if n.status in ("compromised", "suspect")]
+        for node in suspects:
+            self._quarantine(node.id)
+        if suspects:
+            self._set_phase("healing")
+            threading.Timer(2.5, lambda: self._set_phase("idle")).start()
+        else:
+            self._set_phase("idle")
 
     def _quarantine(self, node_id: str):
         with self._lock:
             node = self.nodes.get(node_id)
             if not node:
                 return
-            was_primary     = node.is_primary
-            node.status     = "quarantined"
-            node.type       = "quarantined"
-            node.is_primary = False
+            node.status = "quarantined"
             for edge in self.edges:
                 if edge["source"] == node_id or edge["target"] == node_id:
                     edge["active"] = False
-            self._compromised_nodes.discard(node_id)
-            self._attack_active = len(self._compromised_nodes) > 0
+            # Clear attack tracking once quarantined
+            self._attack_node_ids.discard(node_id)
+            if not self._attack_node_ids:
+                self._attack_node_ids = set()
 
-        self._emit("node_quarantined", {"node_id": node_id, "timestamp": _ts()})
-        self._emit_log(f"🔒 {node_id} QUARANTINED by PBFT consensus", "error")
-        self._emit_log(f"   No votes · no proposals · read-only", "warning")
-        self._push_update()
+        self._emit("node_quarantined", {"node": node_id})
+        self._emit_log(f"🔒 {node_id} QUARANTINED — links severed", "error")
+        self._emit_graph()
 
-        if was_primary:
-            time.sleep(0.4)
-            with self._lock:
-                healthy = self._healthy_nodes()
-                if healthy:
-                    for n in healthy:
-                        n.is_primary = False
-                        n.type = "validator"
-                    self._primary_idx = self._primary_idx % len(healthy)
-                    nxt = healthy[self._primary_idx % len(healthy)]
-                    nxt.is_primary = True
-                    nxt.type = "primary"
-                    nxt_id = nxt.id
-            self._emit_log(f"🔄 Primary rotated to {nxt_id}", "success")
-            self._push_update()
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _set_phase(self, phase: str):
+        self._phase = phase
+        self._emit("phase_change", {"phase": phase})
+        # Reset tick counters when leaving attack so idle math restarts cleanly
+        if phase == "idle":
+            self._attack_node_ids = set()
+            for em in self.edge_metrics.values():
+                em._tick = 0
 
-        healthy_count = sum(1 for n in self.nodes.values() if n.status == "healthy")
-        self._phase = "idle"
-        self._emit("phase_change", {"phase": "idle"})
-        self._emit("network_healed", {"timestamp": _ts(),
-                                      "operational_nodes": healthy_count})
-        self._emit_log(
-            f"✅ Network healed — {healthy_count}/7 validators operational", "success"
-        )
-        self._push_update()
-
-    # ── Helpers ───────────────────────────────────────────────────────────
-
-    def _push_update(self):
-        state = self._full_state()
-        self._emit("graph_update", {"nodes": state["nodes"], "edges": state["edges"]})
-        self._emit("stats_update", {
-            "block_count":       state["block_count"],
-            "tx_rate":           state["tx_rate"],
-            "attack_active":     state["attack_active"],
-            "compromised_nodes": state["compromised_nodes"],
+    def _emit_log(self, msg: str, level: str = "info"):
+        self._emit("log_event", {
+            "message": msg, "level": level,
+            "timestamp": datetime.utcnow().isoformat(),
         })
 
-    def _full_state(self):
+    def _emit_graph(self):
+        self._emit("graph_update", {
+            "nodes": self._node_list(),
+            "edges": self.edges,
+        })
+
+    def _node_list(self) -> list:
+        return [
+            {
+                "id":         n.id,
+                "status":     n.status,
+                "reputation": round(n.reputation, 1),
+                "block_count": len(n.chain),
+                "peers":      n.peers,
+                "attack_type": n.attack_type,
+                "is_primary": (list(self.TOPOLOGY.keys())[self._primary_idx % 7] == n.id),
+            }
+            for n in self.nodes.values()
+        ]
+
+    def _stats(self) -> dict:
+        compromised = [n.id for n in self.nodes.values() if n.status == "compromised"]
+        total_txs   = sum(len(b.get("transactions", [])) for n in self.nodes.values()
+                          for b in n.chain)
         return {
-            "nodes":             [n.to_dict() for n in self.nodes.values()],
-            "edges":             self.edges,
-            "block_count":       self._total_blocks,
-            "tx_rate":           self._tx_rate,
-            "attack_active":     self._attack_active,
-            "compromised_nodes": list(self._compromised_nodes),
-            "timestamp":         _ts(),
+            "block_count":        self._total_blocks,
+            "tx_rate":            random.randint(TX_RATE_BASE - 3, TX_RATE_BASE + 5),
+            "total_transactions": total_txs,
+            "compromised_nodes":  compromised,
+            "phase":              self._phase,
         }
-
-    def _emit(self, event: str, payload: dict):
-        if self.emit_cb:
-            try:
-                self.emit_cb(event, payload)
-            except Exception:
-                pass
-
-    def _emit_log(self, msg: str, log_type: str = "info"):
-        self._emit("log_event", {"message": msg, "type": log_type,
-                                  "timestamp": _ts()})
-
-
-def _avg(items: list, key: str) -> float:
-    return sum(i[key] for i in items) / len(items) if items else 0.0
-
-
-def _ts():
-    return datetime.utcnow().isoformat() + "Z"
