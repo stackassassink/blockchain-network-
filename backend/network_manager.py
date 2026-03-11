@@ -278,6 +278,23 @@ class NetworkManager:
         self._running = True
         threading.Thread(target=self._block_loop,  daemon=True).start()
         threading.Thread(target=self._comms_loop,  daemon=True).start()
+        # Brief delay then emit startup messages so log feed isn't blank
+        threading.Timer(0.5, self._emit_startup_logs).start()
+
+    def _emit_startup_logs(self):
+        """Emit a burst of realistic startup messages to populate the log feed."""
+        startup = [
+            ("🟢 Network initialised — 7 nodes online, 10 edges active", "success"),
+            (f"Genesis block committed on all nodes | height=0", "block"),
+            ("PBFT parameters: n=7, f=2, quorum=5 — fault tolerance active", "info"),
+            ("Primary rotation: N1→N2→N3→N4→N5→N6→N7 (round-robin)", "info"),
+            ("Block interval: 2.0s | Comms tick: 1.5s | TX rate: ~14/s", "info"),
+            ("All edge metrics initialised — baseline latency 8–35ms", "info"),
+            ("Reputation tracker online — threshold: 30% → suspect", "info"),
+            ("Waiting for first block from primary N1…", "info"),
+        ]
+        for i, (msg, level) in enumerate(startup):
+            threading.Timer(i * 0.15, lambda m=msg, l=level: self._emit_log(m, l)).start()
 
     def stop(self):
         self._running = False
@@ -285,10 +302,27 @@ class NetworkManager:
     def pause(self):
         self._paused = True
         self._set_phase("paused")
+        self._emit_log("⏸ NETWORK PAUSED — all block mining and comms suspended", "warning")
+        self._emit_log("All comms loops halted | metrics frozen | ledger write-protected", "info")
 
     def resume(self):
         self._paused = False
         self._set_phase("idle")
+        self._emit_log("▶ NETWORK RESUMED — all nodes back online", "success")
+        self._emit_log("Block mining restarted | comms ticks resuming | metrics live", "info")
+        threading.Timer(0.3, self._push_metrics_snapshot).start()
+
+    def _push_metrics_snapshot(self):
+        """Push current metrics immediately — used after resume/reset so UI isn't blank."""
+        all_metrics = {}
+        for edge in self.edges:
+            key = f"{edge['source']}-{edge['target']}"
+            em  = self.edge_metrics.get(key)
+            if em:
+                em.update(phase="idle", near_attack=False)
+                all_metrics[key] = em.to_dict()
+        if all_metrics:
+            self._emit("all_edge_metrics", all_metrics)
 
     # ── public API ────────────────────────────────────────────────────────────
     def launch_attack(self, attack_type: str, target_id: str):
@@ -337,10 +371,15 @@ class NetworkManager:
                 edge["active"] = True
             for em in self.edge_metrics.values():
                 em.reset_to_idle()
+            self._paused = False
             self._set_phase("idle")
 
-        self._emit_log("🔄 Network reset — all nodes restored", "info")
+        self._emit_log("🔄 NETWORK RESET — all 7 nodes restored to healthy state", "success")
+        self._emit_log("All edges reactivated | reputation scores restored to 100%", "info")
+        self._emit_log("Block ledgers preserved | resuming normal consensus round", "block")
         self._emit_graph()
+        # Push fresh metrics immediately so --ms/--Mb don't show after reset
+        threading.Timer(0.2, self._push_metrics_snapshot).start()
         return {"status": "reset"}
 
     def heal(self):
@@ -400,18 +439,45 @@ class NetworkManager:
                 for i in range(n_tx)]
 
         if primary.status == "compromised" and primary.attack_type == "byzantine":
-            # Byzantine: forge conflicting hashes
             primary.mine_block(txs)
             self._emit_log(
-                f"⚠ Byzantine block from {primary_id} — conflicting hashes broadcast", "warning"
+                f"⚠ Byzantine block #{self._total_blocks} from {primary_id} — "
+                f"conflicting hashes broadcast to peers", "warning"
             )
         elif primary.status not in ("quarantined",):
             block = primary.mine_block(txs)
-            # Replicate to peers
+            block_idx = block["index"]
+
+            # ── Peer replication + rich log messages ──────────────────────
+            peers_updated = []
             for peer_id in primary.peers:
                 peer = self.nodes.get(peer_id)
                 if peer and peer.status not in ("quarantined",):
                     peer.mine_block(txs)
+                    peers_updated.append(peer_id)
+
+            # Pick a random peer to feature in the log
+            if peers_updated:
+                featured_peer = random.choice(peers_updated)
+                msg_template  = random.choice(PEER_MESSAGES)
+                msg = msg_template.format(
+                    node  = primary_id,
+                    peer  = featured_peer,
+                    block = block_idx,
+                    tx    = n_tx,
+                )
+                self._emit_log(
+                    f"{msg} | blk={block_idx} txs={n_tx} "
+                    f"chain-len={len(primary.chain)}", "block"
+                )
+
+            # Occasionally emit a second gossip/heartbeat line for variety
+            if random.random() < 0.4 and len(peers_updated) >= 2:
+                p1, p2 = random.sample(peers_updated, 2)
+                self._emit_log(
+                    f"Gossip: {p1} ↔ {p2} | mempool sync | "
+                    f"height={block_idx} peers={len(peers_updated)}", "info"
+                )
 
         self._total_blocks += 1
         self._drain_reputation()
@@ -462,9 +528,11 @@ class NetworkManager:
         if all_metrics:
             self._emit("all_edge_metrics", all_metrics)
 
-            # Log the worst edge during attack
-            if phase == "attack":
-                vals = list(all_metrics.values())
+            vals      = list(all_metrics.values())
+            phase_now = phase  # captured before lock release
+
+            if phase_now == "attack" and self._attack_node_ids:
+                # Log the worst degraded link
                 near_vals = [v for v in vals
                              if v["source"] in self._attack_node_ids
                              or v["target"] in self._attack_node_ids]
@@ -475,6 +543,38 @@ class NetworkManager:
                         f"lat={worst['latency']}ms bw={worst['bandwidth']:.1f}Mbps "
                         f"loss={worst['packet_loss']}% | LINK DEGRADED",
                         "warning",
+                    )
+
+            elif phase_now == "consensus":
+                self._emit_log(
+                    f"🔐 PBFT round | pre-prepare → prepare → commit | "
+                    f"avg-lat={_avg(vals,'latency'):.0f}ms "
+                    f"avg-loss={_avg(vals,'packet_loss'):.1f}%",
+                    "warning",
+                )
+
+            else:
+                # Idle: emit a realistic peer communication message
+                if vals:
+                    sample  = random.choice(vals)
+                    src, tgt = sample["source"], sample["target"]
+                    # pick a random healthy peer of src for extra realism
+                    node_obj = self.nodes.get(src)
+                    peer_id  = tgt
+                    if node_obj and node_obj.peers:
+                        peer_id = random.choice(node_obj.peers)
+
+                    msg = random.choice(PEER_MESSAGES).format(
+                        node  = src,
+                        peer  = peer_id,
+                        block = self._total_blocks,
+                        tx    = random.randint(1, 9),
+                    )
+                    self._emit_log(
+                        f"{msg} | lat={sample['latency']:.1f}ms "
+                        f"bw={sample['bandwidth']:.1f}Mbps "
+                        f"jitter={sample['jitter']:.1f}ms",
+                        "info",
                     )
 
     # ── healing / PBFT ────────────────────────────────────────────────────────
@@ -488,10 +588,21 @@ class NetworkManager:
         for node in suspects:
             self._quarantine(node.id)
         if suspects:
+            quarantined_ids = [n.id for n in suspects]
+            self._emit_log(
+                f"✅ PBFT commit complete — {', '.join(quarantined_ids)} quarantined | "
+                f"quorum={int(PBFT_QUORUM*7)+1}/7 votes", "success"
+            )
             self._set_phase("healing")
-            threading.Timer(2.5, lambda: self._set_phase("idle")).start()
+            def _finish_healing():
+                self._set_phase("idle")
+                self._emit_log("🟢 Network self-healed — topology restored | routing updated", "success")
+                self._emit_log(f"Healthy nodes: {sum(1 for n in self.nodes.values() if n.status=='healthy')}/7 | Primary rotated", "info")
+                threading.Timer(0.3, self._push_metrics_snapshot).start()
+            threading.Timer(2.5, _finish_healing).start()
         else:
             self._set_phase("idle")
+            self._emit_log("🔍 PBFT scan complete — no suspects confirmed | network clear", "info")
 
     def _quarantine(self, node_id: str):
         with self._lock:
@@ -522,8 +633,10 @@ class NetworkManager:
                 em._tick = 0
 
     def _emit_log(self, msg: str, level: str = "info"):
+        # LogFeed.jsx reads log.type and log.message — use 'type' not 'level'
         self._emit("log_event", {
-            "message": msg, "level": level,
+            "message":   msg,
+            "type":      level,            # ← was "level", must be "type"
             "timestamp": datetime.utcnow().isoformat(),
         })
 

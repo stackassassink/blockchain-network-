@@ -519,13 +519,14 @@ export default function MetricsGraphs({ edgeMetrics, phase }) {
     });
   }, [edgeMetrics]);
 
+  // Each tab gets its metric's signature goodColor so the label matches the graph line
   const TABS = [
-    { key: "all",         label: "ALL"     },
-    { key: "bandwidth",   label: "BW"      },
-    { key: "latency",     label: "LATENCY" },
-    { key: "packet_loss", label: "LOSS"    },
-    { key: "jitter",      label: "JITTER"  },
-    { key: "rtt",         label: "RTT"     },
+    { key: "all",         label: "ALL",     color: "#44ccff" },  // neutral cyan for ALL
+    { key: "bandwidth",   label: "BW",      color: "#00ff88" },  // green  — matches BW graph
+    { key: "latency",     label: "LATENCY", color: "#44ddff" },  // blue   — matches latency graph
+    { key: "packet_loss", label: "LOSS",    color: "#ff8844" },  // orange — matches loss graph
+    { key: "jitter",      label: "JITTER",  color: "#ffee44" },  // yellow — matches jitter graph
+    { key: "rtt",         label: "RTT",     color: "#bb88ff" },  // purple — matches RTT graph
   ];
 
   const visibleMetrics =
@@ -555,26 +556,30 @@ export default function MetricsGraphs({ edgeMetrics, phase }) {
         </div>
         <HealthBanner snapshot={latestSnap} phase={phase} />
 
-        {/* Tabs */}
+        {/* Tabs — each uses its metric's own goodColor */}
         <div style={{ display: "flex", gap: 4 }}>
-          {TABS.map(({ key, label }) => (
-            <button key={key} onClick={() => setActiveTab(key)} style={{
-              flex: 1,
-              padding: "5px 4px",
-              background: activeTab === key ? "#0d2a40" : "#060f1e",
-              border: `1px solid ${activeTab === key ? "#44ccff66" : "#0d2137"}`,
-              borderRadius: 4,
-              color: activeTab === key ? "#44ccff" : "#2a5a7a",
-              fontSize: "9px",
-              fontWeight: 700,
-              letterSpacing: "1px",
-              cursor: "pointer",
-              fontFamily: "'Courier New', monospace",
-              transition: "all 0.15s",
-            }}>
-              {label}
-            </button>
-          ))}
+          {TABS.map(({ key, label, color }) => {
+            const isActive = activeTab === key;
+            return (
+              <button key={key} onClick={() => setActiveTab(key)} style={{
+                flex: 1,
+                padding: "5px 4px",
+                background: isActive ? `${color}18` : "#060f1e",
+                border: `1px solid ${isActive ? color + "88" : color + "22"}`,
+                borderRadius: 4,
+                color: isActive ? color : color + "55",
+                fontSize: "9px",
+                fontWeight: 700,
+                letterSpacing: "1px",
+                cursor: "pointer",
+                fontFamily: "'Courier New', monospace",
+                transition: "all 0.15s",
+                textShadow: isActive ? `0 0 8px ${color}88` : "none",
+              }}>
+                {label}
+              </button>
+            );
+          })}
         </div>
       </div>
 

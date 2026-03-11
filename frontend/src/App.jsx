@@ -124,9 +124,25 @@ export default function App() {
   const doReset = useCallback(() => {
     setIsPaused(false);
     setConsensusVotes({});
+    setLogs([]);                        
     accumulatedMetrics.current = {};
     setEdgeMetrics({});
-    fetch("http://localhost:5000/api/reset", { method:"POST" }).catch(console.error);
+
+    fetch("http://localhost:5000/api/reset", { method: "POST" })
+      .then(() => {
+        return new Promise(r => setTimeout(r, 400));
+      })
+      .then(() =>
+        fetch("http://localhost:5000/api/metrics")
+          .then(r => r.json())
+          .then(data => {
+            if (data && typeof data === "object" && !data.error) {
+              accumulatedMetrics.current = data;
+              setEdgeMetrics({ ...data });
+            }
+          })
+      )
+      .catch(console.error);
   }, []);
   
   const [isPaused, setIsPaused] = useState(false);
@@ -134,6 +150,22 @@ export default function App() {
   const doPause = useCallback(() => {
     const endpoint = isPaused ? "/api/resume" : "/api/pause";
     fetch(`http://localhost:5000${endpoint}`, { method: "POST" })
+      .then(() => {
+        // After resume, re-fetch metrics so panel doesn't stay frozen
+        if (isPaused) {
+          return new Promise(r => setTimeout(r, 400))
+            .then(() =>
+              fetch("http://localhost:5000/api/metrics")
+                .then(r => r.json())
+                .then(data => {
+                  if (data && typeof data === "object" && !data.error) {
+                    accumulatedMetrics.current = data;
+                    setEdgeMetrics({ ...data });
+                  }
+                })
+            );
+        }
+      })
       .catch(console.error);
     setIsPaused(v => !v);
   }, [isPaused]);
