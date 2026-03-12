@@ -17,12 +17,26 @@ const STATUS_COLOR = {
   healthy:"#00ff88", compromised:"#ff4444",
   quarantined:"#ffaa00", healing:"#00ddff", suspect:"#ffee00",
 };
+
 const PHASE_COLOR = {
-  idle:"#00ff88", attack:"#ff4444", consensus:"#cc88ff", healing:"#00ddff",paused:"#ffaa00",
+  idle:      "#00ff88",
+  attack:    "#ff4444",
+  consensus: "#cc88ff",
+  healing:   "#00ddff",
+  paused:    "#ffaa00",
+  critical:  "#ff3e3e",   // ← new
+  frozen:    "#ff9800",   // ← new
+  dead:      "#546e7a",   // ← new
 };
 const PHASE_LABEL = {
-  idle:"NETWORK STABLE", attack:"UNDER ATTACK",
-  consensus:"PBFT CONSENSUS", healing:"HEALING", paused:"⏸ NETWORK PAUSED",
+  idle:      "NETWORK STABLE",
+  attack:    "UNDER ATTACK",
+  consensus: "PBFT CONSENSUS",
+  healing:   "HEALING",
+  paused:    "⏸ NETWORK PAUSED",
+  critical:  "⚠ CRITICAL — ZERO FAULT TOLERANCE",   // ← new
+  frozen:    "🔒 FROZEN — READ ONLY",                // ← new
+  dead:      "💀 DEAD — FULL PARTITION",             // ← new
 };
 
 
@@ -295,8 +309,8 @@ export default function App() {
             borderBottom:"1px solid #0d2137",
           }}>
             NODES: <span style={{ color:"#44ccff", fontWeight:700 }}>{nodes.length}</span>
-            {"  |  "}f={Math.floor((nodes.length-1)/3)}
-            {"  |  "}Q:{Math.floor(nodes.length*0.67)+1}
+            {"  |  "}f={Math.floor(((stats.healthy_count ?? nodes.length)-1)/3)}
+            {"  |  "}Q:{stats.quorum === 0 ? "N/A" : (stats.quorum ?? Math.floor(nodes.length*0.67)+1)}
           </div>
 
           <SLabel>INJECT ATTACK</SLabel>
@@ -404,7 +418,7 @@ export default function App() {
           <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:7 }}>
             {[
               { label:"HEALTHY",     value:healthy,                             color:"#00ff88" },
-              { label:"COMPROMISED", value:compromised,                         color:"#ff4444" },
+              { label:"QUARANTINED", value: nodes.filter(n=>n.status==="quarantined").length, color:"#ff9800" },
               { label:"BLOCKS",      value:stats.block_count?.toLocaleString(), color:"#44ccff" },
               { label:"TX/S",        value:stats.tx_rate,                       color:"#cc88ff" },
             ].map(({ label, value, color }) => (
